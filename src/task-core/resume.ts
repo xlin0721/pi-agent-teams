@@ -1,7 +1,7 @@
 // src/task-core/resume.ts
 // 恢复命令构建与 session id 解析（纯构建器，零依赖、仅 node: 内置 import）
 //
-// 依据：PRD-v3.md §4.4 FR4 — 恢复 = `pi -p --session-dir <dir> --session <id>`
+// 依据：docs-internal/PRD-v3.md §4.4 FR4 — 恢复 = `pi -p --session-dir <dir> --session <id>`
 //（必须带 --session）；session id 从会话 jsonl 文件名 `*_<uuid>.jsonl` 解析。
 // 本模块只产参数数组（不含 "pi"），供 M2 以 spawn("pi", args) 直接使用。
 // 输入约定：文件名入参为 basename（不含目录成分）。

@@ -14,7 +14,7 @@ Single-context: `CONTEXT.md` at the repo root + `docs-internal/adr/` for decisio
 
 ## Docs index
 
-- [PRD-v3.md](PRD-v3.md) — the single project plan (requirements / milestones / technical design; §13.10 is the fix ledger). Read before changing scope or features.
+- [docs-internal/PRD-v3.md](docs-internal/PRD-v3.md) — the single project plan (requirements / milestones / technical design; §13.10 is the fix ledger). Read before changing scope or features.
 - [docs-internal/HANDOFF.md](docs-internal/HANDOFF.md) — session handoff: current milestone status, resume reading order, next-milestone checklist. Read at session start.
 - [docs-internal/DEVLOG.md](docs-internal/DEVLOG.md) — development log (reverse-chronological: per-round changes / decisions / issue closes). Read to see what recently changed.
 - [docs-internal/tech-stack-record.md](docs-internal/tech-stack-record.md) — 技术栈记录（API 契约 / 技术选择 / 预留接口 / 技术债，按开发阶段倒序）。消费 comm/display 契约前必读。

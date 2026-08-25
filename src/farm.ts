@@ -3,7 +3,7 @@
 // session_shutdown 全 kill + cancelled 落盘、GC tick。纯函数与装配分离：纯部分零副作用
 // 可单测（farm.test.ts），装配部分归 08 smoke 实机验证。
 //
-// 依据：.scratch/m2-background-mode/issues/05-farm-loop.md + PRD-v3.md §13.2/§13.3。
+// 依据：.scratch/m2-background-mode/issues/05-farm-loop.md + docs-internal/PRD-v3.md §13.2/§13.3。
 // - ticker：session_start 武装 setInterval(400ms → Queue.step)；回调顶层 try/catch
 //   （防旧 pi 引用 assertActive 等异常崩溃自杀）；句柄模块级锚点、start 先清后武装
 //   （reload/新会话重武装，不残留双 ticker）。

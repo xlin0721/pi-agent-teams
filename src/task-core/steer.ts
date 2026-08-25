@@ -1,5 +1,5 @@
 // src/task-core/steer.ts
-// steer/消息投递核心（PRD-v3.md §13.3 inbox schema）。
+// steer/消息投递核心（docs-internal/PRD-v3.md §13.3 inbox schema）。
 //
 // 职责：向注入的根目录原子写 inbox 消息（<root>/inbox/<to>/<msgId>.json）；
 // latest-wins = 写侧戳 nonce（ts 字段兼任，同进程单调）+ 读侧 pickLatest() 纯助手；

@@ -1,5 +1,7 @@
 # pi-agent-teams
 
+[English](README.md) · **简体中文**
+
 **pi 的可见多智能体协作工作台（visible multi-agent orchestration）——把角色 agent 派进真实终端分屏，可中途指挥、排队干活、agent 间互发消息、开会讨论。每个 agent 都看得见、可交互。**
 
 `pi-agent-teams` 是一个终端优先的 [pi](https://github.com/earendil-works/pi) 扩展，把单个 pi 编码 agent 会话升级为 **agent teams 工作台**。与黑盒子代理不同，你派出的每个 agent 都运行在**真实的终端 pane** 里——你可以看着它干活、直接打字指挥、随时纠偏。
@@ -117,7 +119,6 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 
 ## 文档
 
-- [PRD-v3.md](PRD-v3.md) — 需求 / 里程碑 / 技术设计（唯一计划文档）
 - [CONTEXT.md](CONTEXT.md) — 领域词汇表
 
 > 📖 文档整理中 — 公开的使用/功能指南将补充到 `docs/` 下。

@@ -1,6 +1,6 @@
 # pi-agent-teams
 
-pi-agent-teams 是一个 pi 扩展：让 agent 团队（agent teams）在终端分屏 pane 中以完整交互式 TUI 运行，并管理它们的任务生命周期。术语定义以 PRD-v3.md（§1-§13 项目计划书）为权威来源，本文是词汇快照。
+pi-agent-teams 是一个 pi 扩展：让 agent 团队（agent teams）在终端分屏 pane 中以完整交互式 TUI 运行，并管理它们的任务生命周期。术语定义以 docs-internal/PRD-v3.md（§1-§13 项目计划书）为权威来源，本文是词汇快照。
 
 ## Language
 

@@ -1,5 +1,7 @@
 # pi-agent-teams
 
+**English** · [简体中文](README.zh-CN.md)
+
 **Visible multi-agent orchestration for [pi](https://github.com/earendil-works/pi) — spawn role agents into real terminal panes, steer them mid-task, queue work, message between agents, and hold meetings. Every agent is visible and interactive.**
 
 `pi-agent-teams` is a terminal-first extension that turns a single `pi` coding-agent session into an **agent teams workbench**. Unlike black-box subagents, every agent you spawn gets a **real terminal pane** — you can watch it work, type to it, and redirect it at any time.
@@ -120,7 +122,6 @@ You: farm_status
 
 ## Docs
 
-- [PRD-v3.md](PRD-v3.md) — requirements, milestones, technical design (Chinese)
 - [CONTEXT.md](CONTEXT.md) — domain glossary (Chinese)
 
 > 📖 Documentation in progress — a public usage/feature guide will be added under `docs/`.

@@ -2,7 +2,7 @@
 // 队列循环核心：并发上限（默认 3 可配）/ 重试退避（nextAttemptAt 落盘）/ deadline 仲裁。
 //
 // 依据：.scratch/m1b-task-core/issues/03-queue.md 已批准方案 + .scratch/m2-background-mode/
-//   issues/03-taskcore-patch.md + PRD-v3.md §13.3（M2 修订版迁移表）：
+//   issues/03-taskcore-patch.md + docs-internal/PRD-v3.md §13.3（M2 修订版迁移表）：
 //   - Executor{spawn/steer/kill} 接口本模块声明（M2 真实现与 04-steer 复用）；
 //     spawn(task) → Promise<{paneId, sessionDir}>（M2 签名扩展）；
 //   - tick(input)→TickOutput 纯函数：clock=now 参数注入，零 I/O、零副作用；

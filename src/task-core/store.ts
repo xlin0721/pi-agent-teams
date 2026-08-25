@@ -1,7 +1,7 @@
 // src/task-core/store.ts
 // 任务文件存储（TaskStore）——task record 原子读写 + 一次性快照扫描 + status 信号读取。
 //
-// 依据：issue 02-store 已批准方案 + PRD-v3.md §13.3（task 文件协议 / schema）。
+// 依据：issue 02-store 已批准方案 + docs-internal/PRD-v3.md §13.3（task 文件协议 / schema）。
 // 关键规则：
 //   - 原子写：同目录唯一 tmp（tasks/.<taskId>.<pid>.<randomUUID()>.tmp）→ rename；
 //     读侧永远看到完整 JSON（无撕裂）；失败 catch 时 rm force；目录 mkdir recursive。

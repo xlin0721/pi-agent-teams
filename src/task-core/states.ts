@@ -2,7 +2,7 @@
 // 状态机核心：7 态任务状态机的权威演化逻辑（transition 纯函数）。
 //
 // 依据：.scratch/m1b-task-core/issues/01-states.md 已批准方案
-//   + .scratch/m1b-task-core/spec.md 内联迁移表（PRD-v3.md §13.3 单一事实源）。
+//   + .scratch/m1b-task-core/spec.md 内联迁移表（docs-internal/PRD-v3.md §13.3 单一事实源）。
 // 队列/状态面板/watchdog 共享这份唯一逻辑；本模块零依赖、零 import。
 // node 22 type-stripping 约束：禁 enum/namespace/构造器参数属性（本文件均未使用）。
 

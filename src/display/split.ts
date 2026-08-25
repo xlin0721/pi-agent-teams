@@ -13,7 +13,7 @@
 //   - kill 不存在 pane → exit 1、stderr 含 `no such pane`（spike §6），幂等 kill
 //     容忍此 stderr（重试 kill 旧 paneId 时 pane 可能已被 watchdog 收走）。
 // 本模块零 task-core/store import（display 不感知农场）；探测循环/降级决策归 05 farm。
-// PRD-v3.md §13.2：display 层为纯原语；spawn(task) 装配与 {paneId, sessionDir}
+// docs-internal/PRD-v3.md §13.2：display 层为纯原语；spawn(task) 装配与 {paneId, sessionDir}
 // 落盘在 farm/Executor（06 装配点）。
 
 import { execFile, spawnSync } from "node:child_process";
