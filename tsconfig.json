@@ -1,0 +1,24 @@
+{
+  // pi-agent-teams 类型门（票 03 工程门）：零第三方依赖——不引 @types/node、不建 package.json、
+  // 不碰 node_modules。node: 内置模块与装配层 SDK 包（typebox / pi-coding-agent /
+  // pi-ai）的通配 any 声明在 src/node-modules.d.ts（装配层第三方 API 面为 any 符合
+  // "index.ts 唯一 SDK 边界" 定位）；我们自己的逻辑层（task-core / display / farm /
+  // probe）以真实类型严格检查，禁 any 逃逸。
+  //
+  // erasableSyntaxOnly：禁 enum/namespace/构造器参数属性从纪律升级为编译门，
+  // 与 node 22 type-stripping 对齐（禁 enum/namespace/构造器参数属性）。
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true,
+    "types": [],
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts"]
+}

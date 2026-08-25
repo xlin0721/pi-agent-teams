@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+
+# 本地开发过程记录（含内部 taskId/owner/运行时痕迹），不入库
+.scratch/
+
+# 内部协作文档（本地 git 管理，不上传 GitHub）
+docs-internal/
