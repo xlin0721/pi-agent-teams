@@ -313,3 +313,43 @@ test("at-most-once 跨轮：sink 抛错后消息停留 delivered、下一轮 pol
   assert.equal(second.skipped, 0);
   assert.equal((await readMsgOnDisk(root, PANE, "m1")).status, "delivered");
 });
+
+// ── E4（C9）：pollInbox ownDepth 读侧兜底 ─────────────────────────────────────
+
+test("pollInbox ownDepth：msg.depthCap=2 且 ownDepth=2 → 跳过不投递、记 read（防下轮重见）", async () => {
+  const root = await makeRoot();
+  await writeMsg(root, msg({ msgId: "m1", type: "msg", ts: 1, depthCap: 2 }));
+
+  const received: InboxMessage[] = [];
+  const result = await pollInbox(root, PANE, recordingSink(received), { ownDepth: 2 });
+  assert.equal(received.length, 0); // 不投递
+  assert.equal(result.skipped, 1); // 计 skipped
+  assert.equal((await readMsgOnDisk(root, PANE, "m1")).status, "read"); // 已消费不重见
+
+  // 第二轮：不再重见
+  const received2: InboxMessage[] = [];
+  const second = await pollInbox(root, PANE, recordingSink(received2), { ownDepth: 2 });
+  assert.equal(received2.length, 0);
+  assert.equal(second.skipped, 0);
+});
+
+test("pollInbox ownDepth：msg.depthCap=2 且 ownDepth=1 → 正常投递（depth-1 收信）", async () => {
+  const root = await makeRoot();
+  await writeMsg(root, msg({ msgId: "m1", type: "msg", ts: 1, depthCap: 2 }));
+
+  const received: InboxMessage[] = [];
+  const result = await pollInbox(root, PANE, recordingSink(received), { ownDepth: 1 });
+  assert.deepEqual(received.map((m) => m.msgId), ["m1"]);
+  assert.equal(result.delivered.length, 1);
+  assert.equal(result.skipped, 0);
+});
+
+test("pollInbox ownDepth：无 depthCap 消息不受 ownDepth 门影响（存量兼容）；ownDepth 缺省不过滤", async () => {
+  const root = await makeRoot();
+  await writeMsg(root, msg({ msgId: "m1", type: "msg", ts: 1 }));
+
+  const received: InboxMessage[] = [];
+  const result = await pollInbox(root, PANE, recordingSink(received), { ownDepth: 2 });
+  assert.deepEqual(received.map((m) => m.msgId), ["m1"]); // 无 depthCap → 投递
+  assert.equal(result.skipped, 0);
+});

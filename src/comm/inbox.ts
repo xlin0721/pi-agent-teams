@@ -26,6 +26,8 @@ export interface PollInboxOptions {
   now?: () => number;
   /** 首读无 watermark 时的 mtime 兜底窗口（ms）；缺省 60_000 */
   freshMs?: number;
+  /** 收信 pane 自身 depth（C9 读侧兜底）：ownDepth ≥ msg.depthCap 的消息跳过不投递 */
+  ownDepth?: number;
 }
 
 export interface PollResult {
@@ -69,6 +71,13 @@ function validateMessage(parsed: unknown, msgId: string, paneId: string): InboxM
   if (typeof m.from !== "string" || m.from.length === 0) return null;
   if (m.to !== paneId) return null;
   if (typeof m.content !== "string") return null;
+  // C9 depthCap 可选字段：存在则必须为有限数（缺省 undefined 兼容存量消息）
+  if (
+    m.depthCap !== undefined &&
+    (typeof m.depthCap !== "number" || !Number.isFinite(m.depthCap))
+  ) {
+    return null;
+  }
   return m as unknown as InboxMessage;
 }
 
@@ -167,8 +176,28 @@ export async function pollInbox(
   }
 
   const inbox = new Inbox(inboxRoot);
-  const steers = accepted.filter((m) => m.type === "steer");
-  const msgs = accepted.filter((m) => m.type === "msg");
+  // C9 读侧兜底：ownDepth ≥ depthCap 的消息由收信 pane 直接消费（两次 advance 记 read，
+  // supersede 同款），不投递 sink、计 skipped——防投递侧漏过滤时 depth-2 仍被劫持。
+  const depthGateSkip = async (msg: InboxMessage): Promise<void> => {
+    try {
+      await inbox.advance(msg.msgId, paneId, "delivered");
+      await inbox.advance(msg.msgId, paneId, "read");
+    } catch {
+      // 竞态（文件并发删除/推进）忽略：不投递决策不变
+      return;
+    }
+    result.skipped++;
+  };
+  const steers: InboxMessage[] = [];
+  const msgs: InboxMessage[] = [];
+  for (const m of accepted) {
+    if (typeof opts.ownDepth === "number" && typeof m.depthCap === "number" && opts.ownDepth >= m.depthCap) {
+      await depthGateSkip(m);
+      continue;
+    }
+    if (m.type === "steer") steers.push(m);
+    else msgs.push(m);
+  }
 
   // steer 先（directive 优先级）：latest-wins，其余旧 pending steer 记 read（supersede）
   if (steers.length > 0) {

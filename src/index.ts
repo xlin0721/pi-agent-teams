@@ -540,6 +540,9 @@ function wirePanePresence(store: TaskStore, ownDepthValue: number): void {
  * 30s 未回写 paneId → 跳过 inbox（下会话/重试自然恢复）。
  */
 function armPaneCommReader(pi: ExtensionAPI, store: TaskStore): void {
+  // D2 装配门（C9 读侧兜底双保险）：depth≥2 worker 不 arm comm reader——B 形态本就不
+  // 收 steer/msg；env 丢失时 fail-closed（不 arm = 不收信，宁缺毋劫持）。
+  if (ownDepth(process.env) >= 2) return;
   const taskId = process.env["PI_AGENT_TEAMS_TASK_ID"] ?? "";
   if (taskId === "") return;
   if (paneCommReaderArmed) return;
@@ -739,8 +742,11 @@ async function executeMsgTool(
     const record = await store.readTask(ownTaskId);
     from = resolveMsgFrom(ownTaskId, presences, record);
   }
+  // 会议广播判定（C9 收敛）：编排与投递共用同一过滤寻址（excludeDepthGE:2），
+  // 编排邀请集 == 实际投递集；depthCap:2 随消息落盘供读侧兜底。
+  const meetingBroadcast = meeting && isMeetingBroadcast(params.delivery, params.targets);
   // 会议编排（fan-out 之前）：开会触发判定 → 寻址 → 守卫 paneIds≥2 → openRound/supersede
-  if (meeting && isMeetingBroadcast(params.delivery, params.targets)) {
+  if (meetingBroadcast) {
     const presences = await readPresences(FARM_ROOT);
     const all = await store.scanTasks(null);
     const running = all.filter((t) => t.status === "running");
@@ -751,12 +757,16 @@ async function executeMsgTool(
       setActiveRound(prev === null ? openRound(paneIds, now) : supersede(prev, paneIds, now));
     }
   }
-  return executeMsg(params, {
-    readPresences: () => readPresences(FARM_ROOT),
-    scanTasks: (owner) => store.scanTasks(owner),
-    deliver: (input) => inbox.deliver(input),
-    from,
-  });
+  return executeMsg(
+    params,
+    {
+      readPresences: () => readPresences(FARM_ROOT),
+      scanTasks: (owner) => store.scanTasks(owner),
+      deliver: (input) => inbox.deliver(input),
+      from,
+    },
+    meetingBroadcast ? { excludeDepthGE: 2, depthCap: 2 } : undefined,
+  );
 }
 
 function registerMsgTool(

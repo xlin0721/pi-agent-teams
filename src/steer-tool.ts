@@ -184,24 +184,43 @@ export function msgNoReceiverText(): string {
   return "⚠ 无在运行的接收者：targets 未命中任何存活 pane 或 running 任务。可用 farm_status（无参数）查看全列表。";
 }
 
+/** 寻址过滤选项（C9）：excludeDepthGE 设置时排除 depth≥n 的实例（会议广播传 2）。 */
+export interface ResolveMsgOpts {
+  /** 排除 depth ≥ 该值的实例；缺省/undefined = 不过滤（FR5『all 含 depth-2 worker 收信』契约不变） */
+  excludeDepthGE?: number;
+}
+
 /**
  * 寻址裁决③（纯）：targets 逐项 → paneId[]（去重保序）。
  *   "all" → presence.listAlive() 全部 paneId；presence 空 → 回退 running 记录 paneId；
  *   role  → presence.resolveRole(role)（同名多实例 fan-out）；presence 缺失
  *           → 回退 running 记录 payload.spawn.role 匹配；
  *   空 paneId 一律跳过。
+ * opts.excludeDepthGE：presence 与 running 双路径先滤 depth≥n（depth 缺失/非数保守放行，
+ * 存量记录不误伤）；缺省无过滤。
  */
 export function resolveMsgTargets(
   targets: readonly string[],
   presences: readonly Presence[],
   runningTasks: readonly TaskRecord[],
   now: number,
+  opts?: ResolveMsgOpts,
 ): string[] {
+  const excludeGE = opts?.excludeDepthGE;
+  const depthOk = (depth: unknown): boolean =>
+    excludeGE === undefined ||
+    typeof depth !== "number" ||
+    !Number.isFinite(depth) ||
+    depth < excludeGE;
+  const pres =
+    excludeGE === undefined ? presences : presences.filter((p) => depthOk(p.depth));
+  const running =
+    excludeGE === undefined ? runningTasks : runningTasks.filter((t) => depthOk(t.depth));
   const out: string[] = [];
   const push = (paneId: string): void => {
     if (typeof paneId === "string" && paneId !== "" && !out.includes(paneId)) out.push(paneId);
   };
-  const alivePaneIds = (): string[] => listAlive(presences, now).map((p) => p.paneId);
+  const alivePaneIds = (): string[] => listAlive(pres, now).map((p) => p.paneId);
 
   for (const raw of targets) {
     if (typeof raw !== "string" || raw.trim() === "") continue;
@@ -212,7 +231,7 @@ export function resolveMsgTargets(
         for (const paneId of alive) push(paneId);
       } else {
         // presence 空 → 回退 running 记录 paneId
-        for (const t of runningTasks) {
+        for (const t of running) {
           const paneId = t.payload?.spawn?.paneId;
           if (typeof paneId === "string") push(paneId);
         }
@@ -223,12 +242,12 @@ export function resolveMsgTargets(
       push("main");
       continue;
     }
-    const matched = resolveRole(presences, target, now);
+    const matched = resolveRole(pres, target, now);
     if (matched.length > 0) {
       for (const paneId of matched) push(paneId);
     } else {
       // presence 缺失 → 回退 running 记录 payload.spawn.role 匹配
-      for (const t of runningTasks) {
+      for (const t of running) {
         if (t.payload?.spawn?.role === target) {
           const paneId = t.payload?.spawn?.paneId;
           if (typeof paneId === "string") push(paneId);
@@ -240,10 +259,10 @@ export function resolveMsgTargets(
 }
 
 /**
- * 会议邀请集裁决（C1/C12）：resolveMsgTargets 同形，但过滤 depth≥2 的实例
+ * 会议邀请集裁决（C1/C12 + C9 收敛）：resolveMsgTargets 同形 + excludeDepthGE:2
  * （presence.depth + running task.depth 双路径）——depth-2 worker 无 msg 工具、不回
- * main，拉进会议恒 120s 弃权。只作用于会议邀请集（executeMsgTool 的 meeting 分支），
- * 不改 resolveMsgTargets 全局（FR5「all 含 depth-2 worker 收信」契约不变）。
+ * main，拉进会议恒 120s 弃权。C9 起改为纯透传 opts 的单函数实现（不再复制 depth
+ * 过滤逻辑），与 executeMsg 投递共用同一寻址——编排邀请集 == 实际投递集（结构性）。
  * depth 缺省/非数 → 保守放行（存量记录不误伤）。presence.depth 死字段在此被启用（C12）。
  */
 export function resolveMeetingTargets(
@@ -252,11 +271,7 @@ export function resolveMeetingTargets(
   runningTasks: readonly TaskRecord[],
   now: number,
 ): string[] {
-  const depthLt2 = (depth: unknown): boolean =>
-    typeof depth !== "number" || !Number.isFinite(depth) || depth < 2;
-  const alive = listAlive(presences, now).filter((p) => depthLt2(p.depth));
-  const running = runningTasks.filter((t) => depthLt2(t.depth));
-  return resolveMsgTargets(targets, alive, running, now);
+  return resolveMsgTargets(targets, presences, runningTasks, now, { excludeDepthGE: 2 });
 }
 
 /**
@@ -279,17 +294,27 @@ export function resolveMsgFrom(
   return ownTaskId;
 }
 
+/** 执行选项（C9）：寻址过滤 + 读侧 depthCap 兜底标记。 */
+export interface ExecuteMsgOpts {
+  /** 寻址过滤：排除 depth ≥ n（会议广播传 2；缺省不过滤） */
+  excludeDepthGE?: number;
+  /** 投递消息 depthCap（读侧兜底：ownDepth ≥ depthCap 跳过；缺省不写该字段） */
+  depthCap?: number;
+}
+
 /** 执行：寻址 → 0 命中明示 / fan-out N 条 deliver（逐条 try/catch，部分失败给
- *  可观测反馈）→ ack。 */
+ *  可观测反馈）→ ack。opts.excludeDepthGE 时编排与投递共用同一过滤寻址
+ *  （编排邀请集 == 实际投递集）；opts.depthCap 随消息落盘供读侧兜底。 */
 export async function executeMsg(
   params: MsgToolParams,
   deps: MsgToolDeps,
+  opts?: ExecuteMsgOpts,
 ): Promise<{ content: { type: "text"; text: string }[] }> {
   const now = deps.now?.() ?? Date.now();
   const presences = await deps.readPresences();
   const all = await deps.scanTasks(null);
   const running = all.filter((t) => t.status === "running");
-  const targets = resolveMsgTargets(params.targets ?? [], presences, running, now);
+  const targets = resolveMsgTargets(params.targets ?? [], presences, running, now, opts);
   if (targets.length === 0) {
     return { content: [{ type: "text", text: msgNoReceiverText() }] };
   }
@@ -302,6 +327,7 @@ export async function executeMsg(
         to: paneId,
         delivery: params.delivery,
         content: params.content,
+        ...(typeof opts?.depthCap === "number" ? { depthCap: opts.depthCap } : {}),
       });
     } catch {
       failed += 1;

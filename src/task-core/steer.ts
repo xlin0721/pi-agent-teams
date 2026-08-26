@@ -19,7 +19,7 @@ export type MessageType = "steer" | "msg";
 export type Delivery = "notice" | "directive";
 export type DeliveryStatus = "pending" | "delivered" | "read";
 
-/** inbox 消息 record（严格 §13.3 schema，无扩展字段）。 */
+/** inbox 消息 record（严格 §13.3 schema；C9 起含可选 depthCap，缺省 undefined 兼容存量）。 */
 export interface InboxMessage {
   msgId: string;
   type: MessageType;
@@ -29,15 +29,18 @@ export interface InboxMessage {
   content: string;
   status: DeliveryStatus;
   ts: number;
+  /** 读侧兜底门（C9）：ownDepth ≥ depthCap 的收信 pane 跳过（会议广播传 2）；缺省不写 */
+  depthCap?: number;
 }
 
-/** deliver 入参：msgId/status/ts 由写侧生成，调用方只给这五字段。 */
+/** deliver 入参：msgId/status/ts 由写侧生成，调用方只给这五字段（depthCap 可选）。 */
 export interface DeliverInput {
   type: MessageType;
   from: string;
   to: string;
   delivery: Delivery;
   content: string;
+  depthCap?: number;
 }
 
 const MESSAGE_TYPES: readonly string[] = ["steer", "msg"];
@@ -113,6 +116,7 @@ export class Inbox {
       content: input.content,
       status: "pending",
       ts: this.#nextTs(),
+      ...(typeof input.depthCap === "number" ? { depthCap: input.depthCap } : {}),
     };
     await this.#atomicWrite(this.#msgPath(msg.to, msg.msgId), JSON.stringify(msg));
     return msg;

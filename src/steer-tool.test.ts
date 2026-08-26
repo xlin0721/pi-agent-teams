@@ -521,6 +521,84 @@ test("resolveMeetingTargets：presence 空 → 回退 running 且过滤 depth≥
   assert.deepEqual(resolveMeetingTargets(["main"], [], running, now), ["main"]);
 });
 
+// ── E4（C9）：resolveMsgTargets excludeDepthGE + 编排集==投递集同源不变量 ────────
+
+test("resolveMsgTargets：opts.excludeDepthGE=2 过滤 depth≥2（presence+running 双路径）；缺省不过滤（FR5）", () => {
+  const now = 1700000000000;
+  const presences = [
+    makePresence({ taskId: "a", paneId: "p1", role: "worker", depth: 1, heartbeatAt: now }),
+    makePresence({ taskId: "b", paneId: "p2", role: "worker", depth: 2, heartbeatAt: now }),
+    makePresence({ taskId: "c", paneId: "p3", role: "worker", heartbeatAt: now, depth: undefined as unknown as number }), // depth 缺省（旧记录）→ 保守放行
+  ];
+  const running = [
+    makeTask({
+      taskId: "r1", status: "running", depth: 1,
+      payload: { ...makeTask().payload, spawn: { ...makeTask().payload.spawn, paneId: "rp1", role: "worker" } },
+    }),
+    makeTask({
+      taskId: "r2", status: "running", depth: 2,
+      payload: { ...makeTask().payload, spawn: { ...makeTask().payload.spawn, paneId: "rp2", role: "worker" } },
+    }),
+  ];
+  // 过滤生效：depth≥2 排除、depth 缺省保留、presence 空时 running 回退同样过滤
+  assert.deepEqual(resolveMsgTargets(["all"], presences, running, now, { excludeDepthGE: 2 }), ["p1", "p3"]);
+  assert.deepEqual(resolveMsgTargets(["worker"], [], running, now, { excludeDepthGE: 2 }), ["rp1"]);
+  // 缺省 opts：不过滤（FR5『all 含 depth-2 worker 收信』契约不变）
+  assert.deepEqual(resolveMsgTargets(["all"], presences, running, now), ["p1", "p2", "p3"]);
+});
+
+test("resolveMeetingTargets 与 resolveMsgTargets(...,{excludeDepthGE:2}) 同源不变量（编排集==投递集）", () => {
+  const now = 1700000000000;
+  const presences = [
+    makePresence({ taskId: "a", paneId: "p1", role: "worker", depth: 1, heartbeatAt: now }),
+    makePresence({ taskId: "b", paneId: "p2", role: "worker", depth: 2, heartbeatAt: now }),
+    makePresence({ taskId: "c", paneId: "p3", role: "explorer", depth: 1, heartbeatAt: now }),
+  ];
+  const running = [
+    makeTask({
+      taskId: "r2", status: "running", depth: 2,
+      payload: { ...makeTask().payload, spawn: { ...makeTask().payload.spawn, paneId: "rp2", role: "worker" } },
+    }),
+  ];
+  assert.deepEqual(
+    resolveMeetingTargets(["all"], presences, running, now),
+    resolveMsgTargets(["all"], presences, running, now, { excludeDepthGE: 2 }),
+  );
+  assert.deepEqual(
+    resolveMeetingTargets(["worker", "explorer"], presences, running, now),
+    resolveMsgTargets(["worker", "explorer"], presences, running, now, { excludeDepthGE: 2 }),
+  );
+});
+
+test("executeMsg：opts {excludeDepthGE:2, depthCap:2} 会议投递只到 depth-1 且消息带 depthCap（读侧兜底标记）", async () => {
+  const now = 1700000000000;
+  const presences = [
+    makePresence({ taskId: "a", paneId: "p1", role: "worker", depth: 1, heartbeatAt: now }),
+    makePresence({ taskId: "b", paneId: "p2", role: "worker", depth: 2, heartbeatAt: now }),
+  ];
+  const calls: DeliverInput[] = [];
+  const deps: MsgToolDeps = {
+    readPresences: async () => presences,
+    scanTasks: async () => [],
+    deliver: async (input) => {
+      calls.push(input);
+      return { ...msgMsg(), ...input };
+    },
+    from: "main",
+    now: () => now,
+  };
+  const r = await executeMsg(
+    { targets: ["all"], delivery: "directive", content: "会议" },
+    deps,
+    { excludeDepthGE: 2, depthCap: 2 },
+  );
+  assert.equal(calls.length, 1); // depth-2 不被投递
+  assert.deepEqual(calls[0], {
+    type: "msg", from: "main", to: "p1", delivery: "directive", content: "会议", depthCap: 2,
+  });
+  assert.match(resultText(r), /已向 1 个 agent 发送 directive/);
+});
+
 test("resolveMsgFrom：\"\" → main；presence 命中 → paneId；缺失 → readTask paneId；都缺 → taskId 兜底", () => {
   assert.equal(resolveMsgFrom("", [], null), "main");
   const now = 1700000000000;
