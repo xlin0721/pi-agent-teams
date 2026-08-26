@@ -14,7 +14,7 @@ Community multi-agent tools (task managers, message relays) show agents as lists
 
 | Capability | What you get |
 |---|---|
-| **Spawn** | `spawn_visible_agent` — dispatch a role agent (complete TUI, full tool access) into a new pane, immediately, without blocking your session |
+| **Spawn** | `spawn_visible_agent` — dispatch a role agent (complete TUI, full tool access) into a new pane, immediately, without blocking your session. Pass `sync: true` to block until the task finishes and return its result (spawn-and-wait: summary + exitCode + cost) |
 | **Queue** | Spawn more than the concurrency limit — tasks queue automatically, no babysitting |
 | **Steer** | `steer` — redirect a running agent mid-task ("switch to plan B"); delivered at round boundary |
 | **Message** | `msg` — point-to-point and broadcast between agents (notice / directive) |
@@ -132,9 +132,9 @@ You: farm_status
 
 ## Status
 
-- M0–M7 complete: task-core → background mode → B-form worker windows → command (steer/msg/resume/panel) → meetings → grid + cost + distribution docs
+- M0–M8 complete: task-core → background mode → B-form worker windows → command (steer/msg/resume/panel) → meetings → grid + cost + distribution docs → **sync wait (`sync: true`, M8)**: block until a spawned task finishes and return its result (summary via `status/<id>.result` + SHA-256 cross-check, consumed-dedup so no duplicate `farm.done`, UNFINISHED snapshot on timeout, event-hook + shared-poll wait)
 - Workspace isolation (C1) + delivery-side depth filtering (C9): per-workspace farm roots (`~/.pi-agent-teams/<wsId>/`), meeting broadcasts exclude depth-2 workers, read-side depthCap defense
-- 629 unit tests green, `tsc` zero errors, grep whitelist gates pass
+- 653 unit tests green, `tsc` zero errors, grep whitelist gates pass
 - M5 (session-level scheduling) / M6 (system-level scheduling) deferred by decision
 
 ## License

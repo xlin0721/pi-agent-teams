@@ -14,7 +14,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **派发** | `spawn_visible_agent` — 派一个角色 agent（完整 TUI、全量工具权限）进新 pane，立即返回不阻塞主会话 |
+| **派发** | `spawn_visible_agent` — 派一个角色 agent（完整 TUI、全量工具权限）进新 pane，立即返回不阻塞主会话。传 `sync: true` 阻塞至任务完成并取回结果（spawn-and-wait：摘要 + exitCode + 费用） |
 | **排队** | 超过并发上限自动排队，无需人工调度 |
 | **指挥** | `steer` — 运行中改方向（"改用方案 B"），回合边界软干预 |
 | **通信** | `msg` — agent 间点对点 / 广播（notice 只显示 / directive 触发行动） |
@@ -129,9 +129,9 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 
 ## 状态
 
-- M0–M7 全部完成：task-core → 后台模式 → B 形态 worker 窗口 → 指挥（steer/msg/resume/面板）→ 开会 → 网格 + 成本 + 分发文档
+- M0–M8 全部完成：task-core → 后台模式 → B 形态 worker 窗口 → 指挥（steer/msg/resume/面板）→ 开会 → 网格 + 成本 + 分发文档 → **同步等待（`sync: true`，M8）**：阻塞至任务完成取回结果（经 `status/<id>.result` 摘要 + SHA-256 对拍、consumed 去重不重复 farm.done、超时返 UNFINISHED 快照、事件钩子 + 共享轮询等待）
 - 工作区隔离（C1）+ 投递侧深度过滤（C9）：per-workspace 农场根（`~/.pi-agent-teams/<wsId>/`）、会议广播排除 depth-2 worker、读侧 depthCap 兜底
-- 629 单测全绿 + `tsc` 零错 + grep 白名单全过
+- 653 单测全绿 + `tsc` 零错 + grep 白名单全过
 - M5（会话级定时）/ M6（系统级定时）按决策延期
 
 ## License
