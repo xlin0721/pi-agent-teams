@@ -69,7 +69,7 @@ You: farm_status
      → 5-column table: taskId / role / status / attempts / elapsed
 ```
 
-> 📖 Documentation in progress — a public usage/feature guide will be added under `docs/`.
+> 📖 Usage manual: [docs/README.md](docs/README.md)（中文使用手册：五工具契约 / AI agent 决策卡）。
 
 ---
 
@@ -125,8 +125,7 @@ You: farm_status
 ## Docs
 
 - [CONTEXT.md](CONTEXT.md) — domain glossary (Chinese)
-
-> 📖 Documentation in progress — a public usage/feature guide will be added under `docs/`.
+- [docs/README.md](docs/README.md) — 使用手册（中文，CH1–20 四部：入门 / 概念 / 工具参考 / 工作流运维）
 
 ---
 

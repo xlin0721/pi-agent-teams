@@ -68,7 +68,7 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
     → 5 列台账：taskId / role / status / attempts / 耗时
 ```
 
-> 📖 文档整理中 — 公开的使用/功能指南将补充到 `docs/` 下。
+> 📖 使用手册：[docs/README.md](docs/README.md)（中文，五工具契约 / AI agent 决策卡）。
 
 ---
 
@@ -122,8 +122,7 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 ## 文档
 
 - [CONTEXT.md](CONTEXT.md) — 领域词汇表
-
-> 📖 文档整理中 — 公开的使用/功能指南将补充到 `docs/` 下。
+- [docs/README.md](docs/README.md) — 使用手册（CH1–20 四部：入门 / 概念 / 工具参考 / 工作流运维）
 
 ---
 
