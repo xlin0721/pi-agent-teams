@@ -113,6 +113,11 @@ const WS = resolveWorkspaceRoot({
 });
 const FARM_ROOT = WS.farmRoot;
 const GLOBAL_ROOT = WS.globalRoot;
+/** 启动日志（E5）：输出工作区根解析结果——pane/main 一致性排查与双区并存检测（premortem Top2）。 */
+console.log(
+  `[pi-agent-teams] workspace root: ${WS.farmRoot} (source=${WS.source}` +
+    `${WS.source === "derived" ? `, wsId=${WS.workspaceId}` : ""}, global=${WS.globalRoot})`,
+);
 const AGENTS_DIR = join(getAgentDir(), "agents");
 /** 人设枚举同时看用户目录（getAgentDir）——项目级 .pi/agents 不在 M2 枚举范围 */
 const DEFAULT_TIMEOUT_SECS = 600;
