@@ -63,6 +63,7 @@ import { wireFarm } from "./farm.ts";
 import { Inbox } from "./task-core/steer.ts";
 import type { InboxMessage } from "./task-core/steer.ts";
 import { executeSteer, steerBubbleLines, type SteerToolParams, buildSteerSink, resolveOwnPaneId, executeMsg, executeResume, resolveMsgFrom, resolveMsgTargets, resolveMeetingTargets, type MsgToolParams, type ResumeToolParams } from "./steer-tool.ts";
+import { resolveWorkspaceRoot, WS_ENV } from "./workspace.ts";
 import { pollInbox, readInboxSnapshot } from "./comm/inbox.ts";
 import {
   closeRound,
@@ -103,7 +104,15 @@ import {
 // ── 常量 ─────────────────────────────────────────────────────────────────────
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FARM_ROOT = join(homedir(), ".pi-agent-teams");
+/** 工作区隔离（C1）：FARM_ROOT=~/.pi-agent-teams/<wsId> 派生（env 显式 > cwd 派生）；
+ *  GLOBAL_ROOT=~/.pi-agent-teams（pricing/config 全局配置，不随工作区分区）。 */
+const WS = resolveWorkspaceRoot({
+  cwd: process.cwd(),
+  home: homedir(),
+  envRoot: process.env[WS_ENV] ?? undefined,
+});
+const FARM_ROOT = WS.farmRoot;
+const GLOBAL_ROOT = WS.globalRoot;
 const AGENTS_DIR = join(getAgentDir(), "agents");
 /** 人设枚举同时看用户目录（getAgentDir）——项目级 .pi/agents 不在 M2 枚举范围 */
 const DEFAULT_TIMEOUT_SECS = 600;
@@ -185,7 +194,7 @@ async function runStartupProbe(pi: ExtensionAPI): Promise<void> {
       piBin: invocation.piBin,
       piScript: invocation.piScript,
     };
-    writeFileSync(join(FARM_ROOT, "config.json"), JSON.stringify(config, null, 2));
+    writeFileSync(join(GLOBAL_ROOT, "config.json"), JSON.stringify(config, null, 2));
   } catch {
     // 探测失败不阻断扩展加载
   }
@@ -267,6 +276,7 @@ function wrapperCommand(task: TaskRecord, sessionDir: string, cwd: string): stri
     "/usr/bin/env",
     `PI_AGENT_TEAMS_TASK_ID=${task.taskId}`,
     `PI_AGENT_TEAMS_DEPTH=${task.depth}`,
+    `PI_AGENT_TEAMS_ROOT=${FARM_ROOT}`,
     `DONE_FILE=${join(FARM_ROOT, "status", `${task.taskId}.done`)}`,
     `ABORT_FILE=${join(FARM_ROOT, "status", `${task.taskId}.aborted`)}`,
     `SESS_DIR=${sessionDir}`,
@@ -828,7 +838,7 @@ function getPricingTable(): PricingTable {
   let table: PricingTable = DEFAULT_PRICING_TABLE;
   let placeholder = true;
   try {
-    const parsed = parsePricingTable(readFileSync(join(FARM_ROOT, "pricing.json"), "utf8"));
+    const parsed = parsePricingTable(readFileSync(join(GLOBAL_ROOT, "pricing.json"), "utf8"));
     if (parsed !== null) {
       table = parsed;
       placeholder = false;
