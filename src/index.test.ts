@@ -10,9 +10,10 @@
 //    探测。仍零 pi SDK import（index.ts 的 SDK 装配不在此单测，归 08 smoke）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   FARM_STATUS_VALUES,
   durationText,
@@ -371,6 +372,31 @@ function seedRunningTask(store: TaskStore, taskId: string, now: number, paneId: 
   task.payload.spawn.paneId = paneId;
   return task;
 }
+
+test("票 05 装配契约（源码序 pin）：executeSpawn 含 sync:true 分支（waiter.wait 先于 ack 返回）+ schema 含 sync/wait_timeout_secs", async () => {
+  const src = await readFile(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  // 1) sync 分支：writeTask 之后、scanTasks(ack) 之前走 waiter.wait
+  const syncIdx = src.indexOf("if (params.sync === true && deps.waiter !== undefined");
+  const waitIdx = src.indexOf("deps.waiter.wait(taskId");
+  const writeIdx = src.indexOf("await deps.store.writeTask(record);");
+  const ackIdx = src.indexOf("const all = await deps.store.scanTasks(null);");
+  assert.ok(syncIdx > 0 && waitIdx > syncIdx, "sync 分支存在于 writeTask 之后");
+  assert.ok(writeIdx < syncIdx && syncIdx < ackIdx, "waiter.wait 在 writeTask 之后、ack 之前");
+  // 2) 两处 registerTool schema（main + mini-farm）都含 sync 与 wait_timeout_secs
+  const syncCount = src.split("sync: Type.Optional(Type.Boolean").length - 1;
+  const waitCount = src.split("wait_timeout_secs: Type.Optional").length - 1;
+  assert.equal(syncCount, 2, "main + mini-farm 两处 schema 都含 sync");
+  assert.equal(waitCount, 2, "两处 schema 都含 wait_timeout_secs");
+});
+
+test("FR8 恒定：registerTool 工具名去重 = 5（sync 为参数非新工具名，票 05）", async () => {
+  const src = await readFile(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  const names = new Set<string>();
+  const re = /registerTool\(\{[^}]*?name: "([a-z_]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) names.add(m[1]!);
+  assert.deepEqual([...names].sort(), ["farm_resume", "farm_status", "msg", "spawn_visible_agent", "steer"].sort(), "5 工具恒定（FR8）");
+});
 
 test("adaptListPanes（真函数）：pane_id 数值转字符串、缺失/空项剔除", () => {
   assert.deepEqual(

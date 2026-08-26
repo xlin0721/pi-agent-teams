@@ -446,6 +446,7 @@ function wireHarness(
     tickIntervalMs?: number;
     probeIntervalMs?: number;
     busyDrainTimeoutMs?: number;
+    isConsumed?: (taskId: string) => boolean | Promise<boolean>;
   },
 ): WireHarness {
   const messages: FarmDoneMessage[] = [];
@@ -472,6 +473,7 @@ function wireHarness(
     tickIntervalMs: opts.tickIntervalMs ?? 1_000_000_000,
     probeIntervalMs: opts.probeIntervalMs ?? 1_000_000_000,
     busyDrainTimeoutMs: opts.busyDrainTimeoutMs,
+    isConsumed: opts.isConsumed,
   });
   return { store: opts.store, messages, killSyncCalls, loop };
 }
@@ -690,6 +692,102 @@ test("wireFarm 装配：终态事件单一来源——notifications（aborted/fa
     [["t-do", "done"]],
     "第 2 条：done 经 decisions（无 notifyMain 动作的终态路径）",
   );
+});
+
+test("wireFarm 装配：isConsumed 命中（sync 已消费）→ 不发 farm.done 但 notifiedAt 写回（票 04，评审 R1②③）", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-cons-"));
+  const store = new TaskStore(root);
+  await store.writeTask(taskRecord({ taskId: "t-sync", status: "done", owner: WIRE_OWNER }));
+  let steps = 0;
+  const queue = {
+    store,
+    step: async (): Promise<StepReport> => {
+      steps += 1;
+      return { now: Date.now(), decisions: [{ taskId: "t-sync", event: "paneDone" }], notifications: [] };
+    },
+  } as unknown as Queue;
+  const { messages, loop } = wireHarness(root, {
+    queue,
+    store,
+    tickIntervalMs: 10,
+    isConsumed: async (taskId) => taskId === "t-sync",
+  });
+  t.after(async () => {
+    await loop.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await loop.start();
+  await waitFor(async () => (await store.readTask("t-sync"))?.notifiedAt! > 0, 1500);
+  assert.equal(messages.length, 0, "sync 已消费 → 不发 farm.done");
+});
+
+test("wireFarm 装配：部分事件被 consumed → 只发未消费的（票 04）", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-cons2-"));
+  const store = new TaskStore(root);
+  await store.writeTask(taskRecord({ taskId: "t-a", status: "done", owner: WIRE_OWNER }));
+  await store.writeTask(taskRecord({ taskId: "t-b", status: "done", owner: WIRE_OWNER }));
+  let steps = 0;
+  const queue = {
+    store,
+    step: async (): Promise<StepReport> => {
+      steps += 1;
+      if (steps === 1) {
+        return { now: Date.now(), decisions: [{ taskId: "t-a", event: "paneDone" }], notifications: [] };
+      }
+      return { now: Date.now(), decisions: [{ taskId: "t-b", event: "paneDone" }], notifications: [] };
+    },
+  } as unknown as Queue;
+  const { messages, loop } = wireHarness(root, {
+    queue,
+    store,
+    tickIntervalMs: 10,
+    isConsumed: async (taskId) => taskId === "t-a",
+  });
+  t.after(async () => {
+    await loop.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await loop.start();
+  await waitFor(() => messages.length >= 1, 5000);
+  await waitFor(() => messages.length >= 2, 5000);
+  // t-a 被消费不发；t-b 正常发
+  const seen = messages.map((m) => m.events.map((e) => e.taskId)).flat();
+  assert.ok(!seen.includes("t-a"), "t-a 被 consumed 不应通知");
+  assert.ok(seen.includes("t-b"), "t-b 应正常通知");
+});
+
+test("wireFarm 装配：replay（session_start 补发）路径同查 isConsumed——sync 已消费的死 owner 终态不补发（票 04，评审 R1④）", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-replay-cons-"));
+  const deadPid = await deadChildPid();
+  const store = new TaskStore(root);
+  const now = Date.now();
+  // 死 owner 终态未通知任务（跨重启补发候选）——但 sync 已消费
+  await store.writeTask(
+    taskRecord({
+      taskId: "replay-cons",
+      status: "done",
+      owner: `${deadPid}+${now}`,
+      createdAt: now - 60_000,
+      updatedAt: now - 1_000,
+      startedAt: now - 60_000,
+      notifiedAt: 0,
+    }),
+  );
+  const { messages, loop } = wireHarness(root, {
+    queue: idleQueue(store),
+    store,
+    isConsumed: async (taskId) => taskId === "replay-cons",
+  });
+  t.after(async () => {
+    await loop.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await loop.start(); // session_start 触发 replay
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(messages.length, 0, "replay 路径同查 consumed：sync 已消费不发 farm.done");
 });
 
 test("wireFarm 装配：shutdown × in-flight spawn——stop 有界等 busy 闩排空，双扫 kill 迟到 paneId", async (t) => {

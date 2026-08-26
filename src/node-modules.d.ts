@@ -142,13 +142,23 @@ declare function clearTimeout(handle?: number): void;
 declare function setInterval(callback: (...args: unknown[]) => void, ms?: number): number;
 declare function clearInterval(handle?: number): void;
 
-// ── AbortSignal / AbortController（票 TD2）──────────────────────────────────
+// ── AbortSignal / AbortController（票 TD2 + 票 02 sync-wait 扩展）──────────────
 // Node ≥15 运行时全局（无对应 node: 模块可 import——node:abort_controller 不存在，
 // 故「Node API 走 node: import」不适用，归属 Node 运行时全局最小声明）。面按源码
-// 实际用量：signal?.aborted 只读判定 + new AbortController() 后 .abort()/.signal。
+// 实际用量：signal?.aborted 只读判定 + new AbortController() 后 .abort()/.signal +
+// add/removeEventListener（sync-wait abort 监听）+ AbortSignal.timeout（测试注入）。
 interface AbortSignal {
   readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: "abort", listener: () => void): void;
 }
+
+interface AbortSignalConstructor {
+  readonly prototype: AbortSignal;
+  timeout(milliseconds: number): AbortSignal;
+}
+
+declare var AbortSignal: AbortSignalConstructor;
 
 interface AbortController {
   readonly signal: AbortSignal;

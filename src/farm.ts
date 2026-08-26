@@ -428,6 +428,10 @@ export interface WireFarmOptions {
    * 只在 main（depth-1 角色 agent 不应补发 main 层死 owner 任务，否则 farm.done
    * 通知的 triggerTurn 会抢在初始 prompt 前触发回合，导致 prompt 丢失）。 */
   replayDeadOwner?: boolean;
+  /** sync 等待去重（票 04，评审 R1②）：返回 true = 该终态已被 sync 消费，不发
+   *  farm.done。共享出口 deliver() 检查（flush 与 session_start replay 双路径都走
+   *  deliver）→ 覆盖「wait 阻塞期间」与「consumed 落盘后（跨重启）」两个面。 */
+  isConsumed?: (taskId: string) => boolean | Promise<boolean>;
 }
 
 /** 装配产物：start = session_start 逻辑；stop = session_shutdown 逻辑（均幂等） */
@@ -452,7 +456,9 @@ interface FarmState {
 }
 
 interface FarmContext {
-  cfg: Required<Pick<WireFarmOptions, "queue" | "display" | "owner" | "notify" | "farmRoot" | "now" | "tickIntervalMs" | "probeIntervalMs" | "busyDrainTimeoutMs" | "gcEnabled" | "replayDeadOwner">>;
+  cfg: Required<Pick<WireFarmOptions, "queue" | "display" | "owner" | "notify" | "farmRoot" | "now" | "tickIntervalMs" | "probeIntervalMs" | "busyDrainTimeoutMs" | "gcEnabled" | "replayDeadOwner">> & {
+    isConsumed: WireFarmOptions["isConsumed"];
+  };
   state: FarmState;
 }
 
@@ -515,6 +521,7 @@ export function wireFarm(options: WireFarmOptions): FarmLoop {
       busyDrainTimeoutMs: options.busyDrainTimeoutMs ?? BUSY_DRAIN_TIMEOUT_MS,
       gcEnabled: options.gcEnabled ?? true,
       replayDeadOwner: options.replayDeadOwner ?? true,
+      isConsumed: options.isConsumed,
     },
     state: {
       tickHandle: null,
@@ -702,9 +709,36 @@ async function flushIfDue(ctx: FarmContext): Promise<void> {
  * 通知出口：notify 成功后 notifiedAt 写回。守卫 = owner==本进程 或 owner 进程已死
  * （跨重启补发的死 owner 任务同样写回，防每次重启重复补发；owner 活且非本进程 →
  * 双会话防重，不写回）+ 状态未迁移 + 未通知。
+ * 票 04（评审 R1②）：notify 前查 isConsumed——sync wait 已消费的终态不发 farm.done
+ * （共享出口，flush 与 session_start replay 双路径都走 deliver；全部被消费时跳过
+ * 通知但仍写回 notifiedAt，防 filterReplay 下次补发）。
  */
 async function deliver(ctx: FarmContext, events: readonly FarmDoneEvent[]): Promise<void> {
-  await ctx.cfg.notify({ events, text: buildDoneText(events) });
+  let toDeliver: readonly FarmDoneEvent[] = events;
+  if (ctx.cfg.isConsumed !== undefined) {
+    const skipped: FarmDoneEvent[] = [];
+    for (const event of events) {
+      try {
+        if (await ctx.cfg.isConsumed(event.taskId)) skipped.push(event);
+      } catch {
+        // 检查失败 → 不跳过（保守发通知）
+      }
+    }
+    if (skipped.length > 0) {
+      toDeliver = events.filter((e) => !skipped.includes(e));
+      if (toDeliver.length === 0) {
+        // 全部被 sync 消费：不发 farm.done，但仍写回 notifiedAt（防 replay 补发）
+        await writeBackNotified(ctx, events);
+        return;
+      }
+    }
+  }
+  await ctx.cfg.notify({ events: toDeliver, text: buildDoneText(toDeliver) });
+  await writeBackNotified(ctx, toDeliver);
+}
+
+/** notifiedAt 写回（deliver 共用；单任务失败不挡其余，未写回的由补发兜底）。 */
+async function writeBackNotified(ctx: FarmContext, events: readonly FarmDoneEvent[]): Promise<void> {
   const notifiedAt = ctx.cfg.now();
   for (const event of events) {
     try {

@@ -151,3 +151,7 @@ _Avoid_: 用量文件、cost 文件
 **fixed input line（固定底部输入行）**:
 B 形态渲染器输入行的 Bug#1 降级形态（spec backend#15）：`wireFixedInputLine` 绝对定位最底行 + 单行横向截断（≤cols 绝不折行），避免 readline 折行撕裂 prevRows。默认开启；`PI_RENDERER_FIXED_INPUT=0` 才回旧 readline 路径。
 _Avoid_: 固定输入框（避免与 UI 控件混淆）
+
+**sync wait（同步等待 / sync:true）**:
+`spawn_visible_agent(..., sync: true)` 的可选参数（M8，2026-08-26）：调用后阻塞至任务终态并取回结果（{taskId, status, exitCode, sessionDir, result 摘要, cost, waitedMs, unfinished, timeout}）。缺省 false = 异步零变化。等待机制 = 事件钩子 + 共享轮询 ticker 兜底；超时返回 UNFINISHED 快照 + farm_status/farm_resume 指引（结构性缓冲契约：不抛异常、不静默成功、绝不无限挂）。consumed 去重：sync 返回写 `status/<id>.consumed` + 内存注册表，wireFarm 共享 deliver() 出口查之（flush + replay 双路径）→ 不发 farm.done 不重复触发回合。结果经 wrapper 截写 `status/<id>.result`（message_end 权威全文 + sha256 对拍）。sync 为 opt-in 参数非新工具（FR8 5 工具恒定）。
+_Avoid_: wait_task（未采用的新工具名）、阻塞工具（与异步缺省混淆）

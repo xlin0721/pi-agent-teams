@@ -150,6 +150,26 @@ write_usage() {
     || return 0
 }
 
+# ── result sidecar（票 03，sync 等待）：wrapper 是 .result 唯一写者 ──────────
+# 从最新 session jsonl 提取最后一条 assistant text（锚定 type=message + role=assistant
+# + content[].type=text，评审 R2——message_update delta 与 message_end 权威全文并存时
+# 只取权威全文，不取 delta 残片）→ 截断 8KB → 连同 sha256（jsonl 全文哈希）原子写
+# <FARM_DIR>/status/<taskId>.result = {exitCode, sessionDir, summary, sha256, writtenAt}。
+# 每条 done 路径在 write_done 之前调用（BE#4 写序：write_usage → write_result → write_done）。
+write_result() {
+  local code="$1"
+  [ -n "${PI_NODE:-}" ] || return 0
+  local latest out
+  latest="$(ls -t "$SESS_DIR"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$latest" ] || return 0
+  out="$(RESULT_CODE="$code" RESULT_SESS="$SESS_DIR" "$PI_NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const lines=s.split("\n");let best="";for(const l of lines){let r;try{r=JSON.parse(l)}catch(e){continue}if(r&&r.type==="message"&&r.message&&r.message.role==="assistant"&&Array.isArray(r.message.content)){const t=r.message.content.filter(p=>p&&p.type==="text"&&typeof p.text==="string").map(p=>p.text);if(t.length)best=t.join("\n")}}const c=require("node:crypto");const sha=c.createHash("sha256").update(s).digest("hex");process.stdout.write(JSON.stringify({exitCode:Number(process.env.RESULT_CODE||0),sessionDir:process.env.RESULT_SESS||"",summary:best.slice(0,8192),sha256:sha,writtenAt:Date.now()}))}catch(e){}})' < "$latest")"
+  [ -n "$out" ] || return 0
+  mkdir -p "$FARM_DIR/status" 2>/dev/null || return 0
+  printf '%s\n' "$out" > "$FARM_DIR/status/$PI_AGENT_TEAMS_TASK_ID.result.tmp" \
+    && mv "$FARM_DIR/status/$PI_AGENT_TEAMS_TASK_ID.result.tmp" "$FARM_DIR/status/$PI_AGENT_TEAMS_TASK_ID.result" \
+    || return 0
+}
+
 # ── B 形态（worker）分支（票 06）───────────────────────────────────────────
 # worker：渲染器接管 pane 面（状态条 + 滚动输出 + 输入行），wrapper 只做监督链
 # （jsonl watchdog 判 done + aborted trap + kill-tree + 收尸）。headless pi 由渲染
@@ -200,9 +220,10 @@ if [ "${PI_AGENT_TEAMS_FORM:-tui}" = "worker" ]; then
   done
 
   if [ "$auto_done" = "1" ]; then
-    # jsonl 判 done → 写 usage → pkill 收尸 → 写 done → kill 渲染器树 → 立即 exit
+    # jsonl 判 done → 写 usage → pkill 收尸（jsonl 定型）→ 写 result → 写 done → kill 渲染器树
     write_usage
     pkill_headless
+    write_result 0
     write_done 0
     kill_tree "$PI_PID" 2>/dev/null
     exit 0
@@ -217,6 +238,7 @@ if [ "${PI_AGENT_TEAMS_FORM:-tui}" = "worker" ]; then
       exit 130
     else
       write_usage
+      write_result "$code"
       write_done "$code"
       exit 0
     fi
@@ -336,14 +358,17 @@ while kill -0 "$PI_PID" 2>/dev/null; do
 done
 
 if [ "$auto_done" = "1" ]; then
-  # 判 done → 写 usage → 写 done 文件 → kill pi 进程树 → 立即 exit（无 countdown）
+  # 判 done → 写 usage → 写 result → 写 done 文件 → kill pi 进程树 → 立即 exit（无 countdown）
   write_usage
+  write_result 0
   write_done 0
   kill_tree "$PI_PID" 2>/dev/null
 else
-  # pi 自行退出（/exit 或异常）：写 usage → 按真实退出码写 done
+  # pi 自行退出（/exit 或异常）：写 usage → 按真实退出码写 result + done
   wait "$PI_PID" 2>/dev/null
+  code=$?
   write_usage
-  write_done "$?"
+  write_result "$code"
+  write_done "$code"
 fi
 exit 0

@@ -39,7 +39,7 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -61,6 +61,8 @@ import type { Executor, UsageSidecar } from "./task-core/queue.ts";
 import { findSessionId } from "./task-core/resume.ts";
 import { wireFarm } from "./farm.ts";
 import { Inbox } from "./task-core/steer.ts";
+import { createWaiter } from "./sync-wait.ts";
+import type { Waiter } from "./sync-wait.ts";
 import type { InboxMessage } from "./task-core/steer.ts";
 import { executeSteer, steerBubbleLines, type SteerToolParams, buildSteerSink, resolveOwnPaneId, executeMsg, executeResume, resolveMsgFrom, resolveMsgTargets, resolveMeetingTargets, type MsgToolParams, type ResumeToolParams } from "./steer-tool.ts";
 import { resolveWorkspaceRoot, WS_ENV } from "./workspace.ts";
@@ -391,11 +393,33 @@ export interface SpawnToolInput {
   timeout_secs?: number;
   /** 形态（票 06）：缺省 tui；worker = B 形态状态窗口（pane 内 ANSI 看板 + 背后无头 agent） */
   form?: "tui" | "worker";
+  /** 票 05：true = 阻塞至任务终态并返回结果（spawn-and-wait 语义）；缺省 false = 现有异步零变化 */
+  sync?: boolean;
+  /** 票 05：sync 等待超时秒数（缺省 120，上限 600；含排队时长） */
+  wait_timeout_secs?: number;
 }
 
 interface SpawnDeps {
   display: DisplayClient;
   store: TaskStore;
+  /** 票 05：sync:true 等待器（main/depth-1 装配时传入；缺失时 sync 参数回落异步） */
+  waiter?: Waiter;
+  /** 票 04：consumed/notifiedAt 写入的农场根（sync 返回路径） */
+  farmRoot?: string;
+}
+
+/** 票 05：sync 等待超时缺省（spec D2：120s，上限 600；premortem 建议 + spike 实证） */
+const SYNC_WAIT_TIMEOUT_SECS = 120;
+const SYNC_WAIT_TIMEOUT_MAX_SECS = 600;
+
+/** 写 status/<id>.consumed（评审 R1：sync 等到终态返回后写；O_EXCL 原子创建防并发）。 */
+async function writeConsumed(farmRoot: string, taskId: string): Promise<void> {
+  try {
+    await mkdir(join(farmRoot, "status"), { recursive: true });
+    await writeFile(join(farmRoot, "status", `${taskId}.consumed`), String(Date.now()), { flag: "wx" });
+  } catch {
+    // 已存在（wx 冲突）或不可写 → 幂等忽略
+  }
 }
 
 /**
@@ -404,12 +428,18 @@ interface SpawnDeps {
  * 2) FR9 降级门：每次 spawn 前轻量重探（一次 listPanes）——L1/L2 拒绝 + 文案引导
  *    内置 subagent 工具（不自动路由），任务不落盘不静默丢失；
  * 3) 人设 body 落盘 → 4) 组装 record + writeTask 入队 → 5) 立即返回
- *    taskId + 排队位置（满载「已排队，位置 N」）。
+ *    taskId + 排队位置（满载「已排队，位置 N」）；
+ * 6) 票 05：sync:true → 不立即返回 ack，转入 sync-wait 阻塞至终态/超时/abort，
+ *    返回统一形状 {taskId, status, exitCode, sessionDir, result, cost, waitedMs,
+ *    unfinished, timeout}；返回前写 consumed 标记（评审 R1①）与 notifiedAt 写回
+ *    （评审 R1③：filterReplay 天然排除，跨重启不重复通知）。
  */
 async function executeSpawn(
   params: SpawnToolInput,
   ctx: { cwd?: string },
   deps: SpawnDeps,
+  signal?: AbortSignal,
+  onUpdate?: (message: string) => void,
 ): Promise<unknown> {
   const roles = listAgentRoles(() => readdirSync(AGENTS_DIR));
   const roleError = validateAgentRole(params.agent, roles);
@@ -456,6 +486,70 @@ async function executeSpawn(
     form,
   });
   await deps.store.writeTask(record);
+
+  // 票 05：sync:true → 阻塞等待至终态并返回结果（不立即返回 ack）
+  if (params.sync === true && deps.waiter !== undefined && deps.farmRoot !== undefined) {
+    const timeoutSecs =
+      params.wait_timeout_secs !== undefined
+        ? Math.min(Math.max(params.wait_timeout_secs, 1), SYNC_WAIT_TIMEOUT_MAX_SECS)
+        : SYNC_WAIT_TIMEOUT_SECS;
+    const outcome = await deps.waiter.wait(taskId, {
+      timeoutMs: timeoutSecs * 1000,
+      signal,
+      onProgress: onUpdate,
+    });
+    // 评审 R1①：consumed 标记（原子创建，幂等）
+    await writeConsumed(deps.farmRoot, taskId);
+    // 评审 R1③：notifiedAt 写回（与 deliver 同守卫：owner==本进程）→ filterReplay 排除
+    const rec = await deps.store.readTask(taskId);
+    if (rec !== null && rec.owner === OWNER) {
+      await deps.store.writeTask({ ...rec, notifiedAt: Date.now() });
+    }
+    if (outcome.unfinished) {
+      const guidance =
+        outcome.timeout
+          ? `等待超时（${timeoutSecs}s，含排队时长），任务仍在运行。用 farm_status ${taskId} 查状态；若已 aborted 可用 farm_resume ${taskId} 恢复。`
+          : `等待被取消，任务仍在运行。用 farm_status ${taskId} 查状态。`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `⏳ ${guidance}\n${JSON.stringify(
+              { taskId, status: outcome.status, unfinished: true, timeout: outcome.timeout },
+              null,
+              2,
+            )}`,
+          },
+        ],
+        details: { taskId, role, sync: true, unfinished: true, timeout: outcome.timeout },
+      };
+    }
+    const summary = outcome.resultSource === "none" ? "" : outcome.result;
+    return {
+      content: [
+        {
+          type: "text",
+          text: `✅ 任务 ${taskId} 完成（${outcome.status}，耗时 ${(outcome.waitedMs / 1000).toFixed(1)}s）\n` +
+            `exitCode: ${outcome.exitCode ?? "-"}\n` +
+            `模型: ${outcome.cost.model || "-"}（↑${outcome.cost.inputTokens} ↓${outcome.cost.outputTokens}）\n` +
+            (summary !== "" ? `结果摘要:\n${summary.slice(0, 2000)}\n` : "") +
+            `sessionDir: ${outcome.sessionDir}\n` +
+            `完整会话见 sessionDir；结果来源: ${outcome.resultSource}`,
+        },
+      ],
+      details: {
+        taskId,
+        role,
+        status: outcome.status,
+        exitCode: outcome.exitCode,
+        sessionDir: outcome.sessionDir,
+        resultSource: outcome.resultSource,
+        cost: outcome.cost,
+        waitedMs: outcome.waitedMs,
+        sync: true,
+      },
+    };
+  }
 
   const all = await deps.store.scanTasks(null);
   const position = queuedPosition(all, taskId);
@@ -624,6 +718,9 @@ function assembleMiniFarm(
     owner: OWNER, // 本 pane 进程 pid+启动时间（模块级常量）
   });
 
+  // 票 02/05：sync 等待器（本 farm 的 spawn sync:true 用；isConsumed 供 wireFarm 去重）
+  const waiter = createWaiter({ store: deps.store, farmRoot: FARM_ROOT });
+
   // spawn_visible_agent：executeSpawn 共享，ownDepth(env)=1 → resolveSpawnDepthForm
   // 强制 depth=2 + form=worker
   pi.registerTool({
@@ -662,26 +759,26 @@ function assembleMiniFarm(
         Type.Integer({ minimum: 1, description: "Per-attempt timeout seconds; on timeout the task retries with backoff (default 600)" }),
       ),
       form: Type.Optional(StringEnum(["tui", "worker"])),
+      sync: Type.Optional(Type.Boolean({ description: "true = 阻塞至任务终态并返回结果（spawn-and-wait）；缺省 false = 异步立即返回 taskId" })),
+      wait_timeout_secs: Type.Optional(
+        Type.Integer({ minimum: 1, description: "sync 等待超时秒数（缺省 120，上限 600；含排队时长）" }),
+      ),
     }),
     prepareArguments(args: unknown) {
       if (args === null || typeof args !== "object") return args;
       const { title: _title, destroy_delay_secs: _delay, ...rest } = args as Record<string, unknown>;
       return rest;
     },
-    async execute(_toolCallId: unknown, params: unknown, _signal: unknown, _onUpdate: unknown, ctx: unknown) {
-      return executeSpawn(params as SpawnToolInput, ctx as { cwd?: string }, { display: deps.display, store: deps.store });
+    async execute(_toolCallId: unknown, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
+      return executeSpawn(
+        params as SpawnToolInput,
+        ctx as { cwd?: string },
+        { display: deps.display, store: deps.store, waiter: waiter, farmRoot: FARM_ROOT },
+        signal as AbortSignal,
+        onUpdate as (message: string) => void,
+      );
     },
   });
-
-  // msg（票 04）：depth-1 角色 agent 注册 msg 工具（fan-out 到 worker/其他 pane）
-  // meeting=false：会议编排只在 main（depth-1 不开会）。
-  registerMsgTool(pi, { store: deps.store, inbox: deps.inbox }, false);
-
-  // farm_resume（审计收尾 A1）：depth-1 注册 farm_resume，仅可恢复本 owner 的 depth-2 worker
-  registerResumeTool(pi, deps.store);
-
-  // comm reader（票 03/04 的 buildSteerSink）：400ms pollInbox 轮询（steer + msg 送达）
-  armPaneCommReader(pi, deps.store);
 
   // mini-farm 循环：gcEnabled:false（GC 只在 main）+ replayDeadOwner:false
   // （跨重启补发只在 main——depth-1 角色 agent 不接管 main 层死 owner 任务，
@@ -706,7 +803,27 @@ function assembleMiniFarm(
     farmRoot: FARM_ROOT,
     gcEnabled: false,
     replayDeadOwner: false,
+    // 票 04（评审 R1②）：sync 已消费的终态不发 farm.done（共享 deliver 出口，flush+replay 双路径）
+    isConsumed: async (taskId: string) => {
+      if (waiter.isWaiting(taskId)) return true;
+      try {
+        await stat(join(FARM_ROOT, "status", `${taskId}.consumed`));
+        return true;
+      } catch {
+        return false;
+      }
+    },
   });
+
+  // msg（票 04）：depth-1 角色 agent 注册 msg 工具（fan-out 到 worker/其他 pane）
+  // meeting=false：会议编排只在 main（depth-1 不开会）。
+  registerMsgTool(pi, { store: deps.store, inbox: deps.inbox }, false);
+
+  // farm_resume（审计收尾 A1）：depth-1 注册 farm_resume，仅可恢复本 owner 的 depth-2 worker
+  registerResumeTool(pi, deps.store);
+
+  // comm reader（票 03/04 的 buildSteerSink）：400ms pollInbox 轮询（steer + msg 送达）
+  armPaneCommReader(pi, deps.store);
 }
 
 /**
@@ -1059,6 +1176,8 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
     maxConcurrency: MAX_CONCURRENCY,
     owner: OWNER,
   });
+  // 票 02/05：sync 等待器（main 的 spawn sync:true 用；isConsumed 供 wireFarm 去重）
+  const waiter = createWaiter({ store, farmRoot: FARM_ROOT });
 
   pi.registerTool({
     name: "spawn_visible_agent",
@@ -1071,8 +1190,13 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
       "= interactive pi TUI; 'worker' = status-window form (pane 内 ANSI 看板 + 背后无头 agent；" +
       "M2.5 由 main 显式传，M3 起 depth≥2 自动). " +
       "Results arrive as a farm.done notification (taskId/role/status/耗时/exitCode) — NEVER fabricate " +
-      "or assume the task's result before the farm.done notification arrives. If you need the result " +
-      "synchronously (blocking), use the built-in subagent tool instead. " +
+      "or assume the task's result before the farm.done notification arrives. " +
+      "Pass sync:true to block until the task finishes and return its result (spawn-and-wait; " +
+      "default false = async, zero behavior change). Sync assumes low queue occupancy; for long " +
+      "tasks (>30s) prefer async + farm_status / farm.done. While waiting, no other tool can be called " +
+      "(the turn is suspended) — for mid-task steering use async mode + steer. " +
+      "If you need the result synchronously, sync:true is the visible-pane option; the built-in " +
+      "subagent tool remains for lightweight in-process work. " +
       "Optional agent persona: resolved from ~/.pi/agent/agents/<name>.md" +
       (agentRoles.length > 0 ? ` (available: ${agentRoles.join(", ")})` : " (currently none available)") +
       ". Check progress anytime with farm_status <taskId>.",
@@ -1098,6 +1222,10 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
         Type.Integer({ minimum: 1, description: "Per-attempt timeout seconds; on timeout the task retries with backoff (default 600)" }),
       ),
       form: Type.Optional(StringEnum(["tui", "worker"])),
+      sync: Type.Optional(Type.Boolean({ description: "true = 阻塞至任务终态并返回结果（spawn-and-wait）；缺省 false = 异步立即返回 taskId。同步等待假定低队列占用，满载时建议用异步 + farm_status。等待期间不可调其他工具（回合挂起）" })),
+      wait_timeout_secs: Type.Optional(
+        Type.Integer({ minimum: 1, description: "sync 等待超时秒数（缺省 120，上限 600；含排队时长）" }),
+      ),
     }),
     // v2 会话恢复兼容：v2 的 title/destroy_delay_secs 在 v3 无对应语义（标题派生自
     // role+prompt、wrapper 无 countdown），剥离避免旧参数卡死 schema 校验。
@@ -1106,8 +1234,14 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
       const { title: _title, destroy_delay_secs: _delay, ...rest } = args as Record<string, unknown>;
       return rest;
     },
-    async execute(_toolCallId: unknown, params: unknown, _signal: unknown, _onUpdate: unknown, ctx: unknown) {
-      return executeSpawn(params as SpawnToolInput, ctx as { cwd?: string }, { display, store });
+    async execute(_toolCallId: unknown, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
+      return executeSpawn(
+        params as SpawnToolInput,
+        ctx as { cwd?: string },
+        { display, store, waiter, farmRoot: FARM_ROOT },
+        signal as AbortSignal,
+        onUpdate as (message: string) => void,
+      );
     },
   });
 
@@ -1173,6 +1307,16 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
       );
     },
     farmRoot: FARM_ROOT,
+    // 票 04（评审 R1②）：sync 已消费的终态不发 farm.done（共享 deliver 出口，flush+replay 双路径）
+    isConsumed: async (taskId: string) => {
+      if (waiter.isWaiting(taskId)) return true;
+      try {
+        await stat(join(FARM_ROOT, "status", `${taskId}.consumed`));
+        return true;
+      } catch {
+        return false;
+      }
+    },
   });
 
   wirePanel(pi, store);   // 票 07：setWidget 主会话面板（1s ticker + shutdown 清理）
