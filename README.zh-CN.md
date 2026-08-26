@@ -84,8 +84,9 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 │  └───────────┘ └───────────┘ └───────────┘                 │
 │        │             │             │                       │
 │  ┌─────┴─────────────┴─────────────┴──────────────────┐    │
-│  │ ~/.pi-agent-teams/（单一事实源）                   │    │
-│  │ tasks/  status/  sessions/  inbox/  usage/  ...   │    │
+│  │ ~/.pi-agent-teams/<wsId>/（按工作区分区）          │    │
+│  │ tasks/ status/ sessions/ inbox/ usage/ ...         │    │
+│  │ ~/.pi-agent-teams/（全局：pricing/config）         │    │
 │  └───────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
         │ spawn / steer / msg / resume
@@ -111,6 +112,7 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 
 ### 关键不变量
 
+- **工作区隔离** — 每个项目（cwd）有自己的农场根 `~/.pi-agent-teams/<workspaceId>/`；全局配置（`pricing.json`/`config.json`）留在 `~/.pi-agent-teams/`
 - **零第三方依赖** — 无 `package.json` / `node_modules`；pi SDK import 仅限 `index.ts`（唯一运行时边界）
 - **单写者矩阵** — task 文件：所属队列；done/aborted：wrapper；usage sidecar：wrapper；inbox：发送方；presence：各 pane 进程
 - **WezTerm 单目标** — macOS；环境不可用时优雅降级（L0/L1/L2）
@@ -128,7 +130,8 @@ pi： ✅ task 1a2b3c (product-lead) 排队中 → 运行中
 ## 状态
 
 - M0–M7 全部完成：task-core → 后台模式 → B 形态 worker 窗口 → 指挥（steer/msg/resume/面板）→ 开会 → 网格 + 成本 + 分发文档
-- 610 单测全绿 + `tsc` 零错 + grep 白名单全过
+- 工作区隔离（C1）+ 投递侧深度过滤（C9）：per-workspace 农场根（`~/.pi-agent-teams/<wsId>/`）、会议广播排除 depth-2 worker、读侧 depthCap 兜底
+- 629 单测全绿 + `tsc` 零错 + grep 白名单全过
 - M5（会话级定时）/ M6（系统级定时）按决策延期
 
 ## License

@@ -86,8 +86,9 @@ You: farm_status
 │  └───────────┘ └───────────┘ └───────────┘                 │
 │        │             │             │                       │
 │  ┌─────┴─────────────┴─────────────┴──────────────────┐    │
-│  │ ~/.pi-agent-teams/ (single source of truth)       │    │
-│  │ tasks/  status/  sessions/  inbox/  usage/  ...   │    │
+│  │ ~/.pi-agent-teams/<wsId>/  (per-workspace)         │    │
+│  │ tasks/ status/ sessions/ inbox/ usage/ ...         │    │
+│  │ ~/.pi-agent-teams/  (global: pricing/config)       │    │
 │  └───────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
         │ spawn / steer / msg / resume
@@ -114,6 +115,7 @@ You: farm_status
 
 ### Key invariants
 
+- **Workspace isolation** — each project (cwd) gets its own farm root `~/.pi-agent-teams/<workspaceId>/`; global config (`pricing.json`/`config.json`) stays at `~/.pi-agent-teams/`
 - **Zero third-party deps** — no `package.json`, `node_modules`, or pi SDK imports outside `index.ts` (the only runtime boundary)
 - **Single-writer matrix** — task files: the owning queue; done/aborted: the wrapper; usage sidecar: the wrapper; inbox: sender; presence: each pane process
 - **WezTerm-only** — macOS single target; graceful degradation (L0/L1/L2) when the environment is unavailable
@@ -131,7 +133,8 @@ You: farm_status
 ## Status
 
 - M0–M7 complete: task-core → background mode → B-form worker windows → command (steer/msg/resume/panel) → meetings → grid + cost + distribution docs
-- 610 unit tests green, `tsc` zero errors, grep whitelist gates pass
+- Workspace isolation (C1) + delivery-side depth filtering (C9): per-workspace farm roots (`~/.pi-agent-teams/<wsId>/`), meeting broadcasts exclude depth-2 workers, read-side depthCap defense
+- 629 unit tests green, `tsc` zero errors, grep whitelist gates pass
 - M5 (session-level scheduling) / M6 (system-level scheduling) deferred by decision
 
 ## License

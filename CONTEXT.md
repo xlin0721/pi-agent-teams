@@ -11,8 +11,12 @@ pi-agent-teams 是一个 pi 扩展：让 agent 团队（agent teams）在终端�
 _Avoid_: crew、层级编排
 
 **Farm（农场）**:
-一组同属一个工作区的 agent pane（v3 中通常是一个终端窗口内的多个 tab）。
-_Avoid_: 工作区（与文件系统路径含义冲突）、群组
+一组同属一个工作区（workspace）的 agent pane（v3 中通常是一个终端窗口内的多个 tab）。
+_Avoid_: 群组
+
+**Workspace（工作区 / workspaceId）**:
+由 pi 启动目录（cwd）经 realpath 归一化 + sha256 前 12 hex 派生的隔离单元（`src/workspace.ts`，C1 2026-08-26）。`FARM_ROOT = ~/.pi-agent-teams/<workspaceId>`（运行态目录 tasks/status/presence/inbox/sessions/usage/requests）；`GLOBAL_ROOT = ~/.pi-agent-teams` 存全局配置（pricing.json/config.json）。解析优先级：env `PI_AGENT_TEAMS_ROOT`（spawn 链显式传递）> cwd 派生 > cwd 空回退 home。不同项目目录进 pi cli 各归各的工作区，子代理列表/状态/消息互不可见。
+_Avoid_: legacy 根（~/.pi-agent-teams 根下历史数据归档、不再读取）
 
 **Main session（主会话）**:
 运行 main agent 的那个 pi 会话/窗口——用户唯一对话入口，负责调度派发、接收摘要通知、向角色 agent 发 steer。main 是团队领导者，不是普通成员。
