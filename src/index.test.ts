@@ -398,6 +398,15 @@ test("FR8 恒定：registerTool 工具名去重 = 5（sync 为参数非新工具
   assert.deepEqual([...names].sort(), ["farm_resume", "farm_status", "msg", "spawn_visible_agent", "steer"].sort(), "5 工具恒定（FR8）");
 });
 
+test("M8 修复：心跳 onUpdate 契约 = 对象 {content:[{type:'text'}]}（非字符串，防 TUI result.content undefined 崩溃）", async () => {
+  const src = await readFile(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  // 1) 适配函数存在且构造对象 content
+  assert.match(src, /heartbeatToOnUpdate/, "心跳适配函数存在");
+  assert.match(src, /content: \[\{ type: "text", text: message \}\]/, "onUpdate 传对象 content 数组（bash 工具同款契约）");
+  // 2) 无字符串直传残留
+  assert.ok(!src.includes("onUpdate as (message: string) => void"), "不再把 pi onUpdate 当字符串回调");
+});
+
 test("adaptListPanes（真函数）：pane_id 数值转字符串、缺失/空项剔除", () => {
   assert.deepEqual(
     adaptListPanes([{ pane_id: 42, title: "a" }, { title: "no pane_id" }, { pane_id: 7 }]),

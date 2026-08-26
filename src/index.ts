@@ -412,6 +412,25 @@ interface SpawnDeps {
 const SYNC_WAIT_TIMEOUT_SECS = 120;
 const SYNC_WAIT_TIMEOUT_MAX_SECS = 600;
 
+/**
+ * pi 扩展 execute 的 onUpdate 契约（M8 修复：曾误当字符串回调透传，导致 TUI
+ * `{...partialResult}` 展开字符串 → result.content undefined → getTextOutput
+ * undefined.filter 崩溃）。真实契约 = 对象 {content:[{type:"text",text}]}（与
+ * 工具返回值同构，作 partialResult；bash 工具同款用法）。
+ */
+export type ToolOnUpdate = (update: { content: unknown[]; details?: unknown }) => void;
+
+/** sync 等待心跳适配：纯逻辑消息字符串 → pi onUpdate 对象契约（M8 修复）。 */
+function heartbeatToOnUpdate(onUpdate: ToolOnUpdate | undefined) {
+  return (message: string): void => {
+    try {
+      onUpdate?.({ content: [{ type: "text", text: message }] });
+    } catch {
+      // 心跳上报失败不阻断等待
+    }
+  };
+}
+
 /** 写 status/<id>.consumed（评审 R1：sync 等到终态返回后写；O_EXCL 原子创建防并发）。 */
 async function writeConsumed(farmRoot: string, taskId: string): Promise<void> {
   try {
@@ -439,7 +458,7 @@ async function executeSpawn(
   ctx: { cwd?: string },
   deps: SpawnDeps,
   signal?: AbortSignal,
-  onUpdate?: (message: string) => void,
+  onUpdate?: ToolOnUpdate,
 ): Promise<unknown> {
   const roles = listAgentRoles(() => readdirSync(AGENTS_DIR));
   const roleError = validateAgentRole(params.agent, roles);
@@ -496,7 +515,7 @@ async function executeSpawn(
     const outcome = await deps.waiter.wait(taskId, {
       timeoutMs: timeoutSecs * 1000,
       signal,
-      onProgress: onUpdate,
+      onProgress: heartbeatToOnUpdate(onUpdate),
     });
     // 评审 R1①：consumed 标记（原子创建，幂等）
     await writeConsumed(deps.farmRoot, taskId);
@@ -775,7 +794,7 @@ function assembleMiniFarm(
         ctx as { cwd?: string },
         { display: deps.display, store: deps.store, waiter: waiter, farmRoot: FARM_ROOT },
         signal as AbortSignal,
-        onUpdate as (message: string) => void,
+        onUpdate as ToolOnUpdate,
       );
     },
   });
@@ -1240,7 +1259,7 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
         ctx as { cwd?: string },
         { display, store, waiter, farmRoot: FARM_ROOT },
         signal as AbortSignal,
-        onUpdate as (message: string) => void,
+        onUpdate as ToolOnUpdate,
       );
     },
   });
