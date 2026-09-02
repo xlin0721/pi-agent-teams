@@ -1,5 +1,6 @@
 // src/task-core/store.ts
-// 任务文件存储（TaskStore）——task record 原子读写 + 一次性快照扫描 + status 信号读取。
+// 任务文件存储（TaskStore）——task record 原子读写 + 一次性快照扫描 + status 信号读取
+// + 复查式删除（deleteTask，票 01）。
 //
 // 依据：issue 02-store 已批准方案 + docs-internal/PRD-v3.md §13.3（task 文件协议 / schema）。
 // 关键规则：
@@ -7,6 +8,8 @@
 //     读侧永远看到完整 JSON（无撕裂）；失败 catch 时 rm force；目录 mkdir recursive。
 //   - 单写者：task 文件唯一写者 = 拥有者进程；投递态不进 task 文件（inbox 归 04-steer）。
 //   - 轮询：scanTasks 一次性快照；400ms 循环归调用方；禁 fs.watch。
+//   - 复查式删除（deleteTask，票 01）：不信任调用方快照，readTask 现读 → 真终态 + 通知守卫
+//     重验 → rm force 幂等（镜像 removeStatusSignal read-before-rm 纪律）。
 //   - 零依赖：仅 node: 内置模块；node 22 type-stripping（禁 enum/namespace/构造器参数属性）。
 
 import { randomUUID } from "node:crypto";
@@ -16,6 +19,10 @@ import { join } from "node:path";
 // TaskStatus 权威来源：states.ts（状态机单一事实源，7 态 union，§13.3）。
 // type-only 导入，零运行时依赖（node 22 type-stripping 下被完整擦除）。
 import type { TaskStatus } from "./states.ts";
+
+// 真终态 / 通知守卫纯逻辑（票 02 cleanup.ts）。运行时边仅 store → cleanup 单向：
+// cleanup → store 为 import type（type-stripping 下完整擦除）→ 运行时无环。
+import { isTrulyTerminal, isCleanableTerminal } from "./cleanup.ts";
 
 /**
  * taskId 安全段校验（writeTask/readTask/readStatusSignal 入口）：防路径逃逸。
@@ -121,6 +128,25 @@ export interface ReadStatusSignalOptions {
    * 调用方与旧落盘记录 startedAt=0）。
    */
   since?: number;
+}
+
+/** 通知守卫缺省补发窗：24h。数值 pin：farm.ts:63 REPLAY_WINDOW_MS——task-core 层
+ * 不 import farm 层（分层纪律），以本地副本 + 注释 pin 保持单一事实源；消费方
+ * （03 sweep / 05 farm_cleanup）显式传 replayWindowMs 消除数值漂移风险。 */
+const DEFAULT_REPLAY_WINDOW_MS = 24 * 3600 * 1000;
+
+/** deleteTask 跳过原因分组（供 03 sweep / 05 farm_cleanup 的 skipped 分组统计复用）。 */
+export type DeleteSkipReason = "missing" | "not-terminal" | "unnotified";
+
+/** deleteTask 返回值：判别联合（deleted:true | skipped+reason），无非法状态。 */
+export type DeleteTaskResult =
+  | { deleted: true }
+  | { deleted: false; reason: DeleteSkipReason };
+
+/** deleteTask 可选入参（now / replayWindowMs 可注入，单测确定性；缺省 = Date.now() / 24h）。 */
+export interface DeleteTaskOptions {
+  now?: number;
+  replayWindowMs?: number;
 }
 
 /** 解析 status/<id>.done：JSON 且 exitCode 为 number、sessionDir 为 string，否则 null。 */
@@ -318,5 +344,32 @@ export class TaskStore {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 复查式删除（票 01）：readTask 现读 → 重验谓词 → rm force 幂等。
+   *   ① assertSafeTaskId 先于一切 I/O（与 readTask/writeTask 同门抛 TypeError）；
+   *   ② now / replayWindowMs 取 opts 或缺省（Date.now() / 24h pin farm.ts:63）；
+   *   ③ readTask 现读：缺文件 / 坏 JSON / 根非对象 → null → {deleted:false,reason:"missing"}
+   *     不抛（坏文件「无法验谓词即不删」取安全方向，坏文件清理归 03 sweep 侧）；
+   *   ④ !isTrulyTerminal → {deleted:false,reason:"not-terminal"}（复查时已复活/活跃/可复活）；
+   *   ⑤ !isCleanableTerminal(record, now, replayWindowMs) → {deleted:false,reason:"unnotified"}
+   *     （真终态但守卫不过：notifiedAt=0 且 updatedAt 仍在补发窗内——先删会丢通知，违 PRD §4.9）；
+   *   ⑥ rm force 幂等（删链接本身、不跟随目标）；失败原样抛出（调用方记 failed 计数）。
+   * ④⑤ 双层调用换取 reason 二分（可复活 vs 未通知）；isCleanableTerminal 内重复判
+   * 真终态为无害纯函数调用。
+   */
+  async deleteTask(taskId: string, opts?: DeleteTaskOptions): Promise<DeleteTaskResult> {
+    assertSafeTaskId(taskId);
+    const now = opts?.now ?? Date.now();
+    const replayWindowMs = opts?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
+    const record = await this.readTask(taskId);
+    if (record === null) return { deleted: false, reason: "missing" };
+    if (!isTrulyTerminal(record)) return { deleted: false, reason: "not-terminal" };
+    if (!isCleanableTerminal(record, now, replayWindowMs)) {
+      return { deleted: false, reason: "unnotified" };
+    }
+    await rm(this.taskPath(taskId), { force: true });
+    return { deleted: true };
   }
 }

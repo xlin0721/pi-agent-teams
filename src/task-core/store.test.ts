@@ -3,7 +3,7 @@
 // 根目录一律用 fs.mkdtemp 注入（每个用例独立临时目录，结束强制清理）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "./store.ts";
@@ -528,5 +528,114 @@ test("removeStatusSignal：beforeMs 只删陈旧信号（mtime < cutoff），新
     // beforeMs 缺省 → 旧行为（存在即删，兼容 startedAt=0 存量记录）
     await store.removeStatusSignal("t");
     await assert.rejects(readFile(aborted, "utf8"));
+  });
+});
+
+// ---------- 复查式删除（票 01 deleteTask） ----------
+
+test("deleteTask：存在且真终态+已通知 → 删除成功；文件消失、scanTasks 不含、无 tmp 残留", async () => {
+  await withStore(async (store, root) => {
+    await store.writeTask(fullRecord({ taskId: "a", status: "done", notifiedAt: 5_000 }));
+    assert.deepEqual(await store.deleteTask("a"), { deleted: true });
+    // 文件消失
+    await assert.rejects(readFile(join(root, "tasks", "a.json"), "utf8"));
+    // 扫描不含；tasks 目录无任何残留（tmp 等）
+    assert.deepEqual((await store.scanTasks()).map((r) => r.taskId), []);
+    assert.deepEqual(await readdir(join(root, "tasks")), []);
+  });
+});
+
+test("deleteTask：缺失任务 → no-op 不抛、{deleted:false,reason:'missing'}、无文件产生", async () => {
+  await withStore(async (store, root) => {
+    assert.deepEqual(await store.deleteTask("nope"), { deleted: false, reason: "missing" });
+    // 不产生任何文件/目录（缺文件 → missing，绝不为删除 mkdir）
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
+test("deleteTask：非法 taskId → 抛 TypeError，且校验先于 I/O（root 无 tasks 目录）", async () => {
+  await withStore(async (store, root) => {
+    for (const bad of ["", ".", "..", "a/b", "a\\b"]) {
+      await assert.rejects(store.deleteTask(bad), TypeError);
+    }
+    // 校验先于 readTask/rm：非法 id 不应产生 tasks 目录或任何文件
+    const names = await readdir(root);
+    assert.ok(!names.includes("tasks"));
+  });
+});
+
+test("deleteTask：幂等删除 + 并发双清（Promise.all）→ 不抛、无残留、结果均为 deleted 或 missing", async () => {
+  await withStore(async (store, root) => {
+    await store.writeTask(fullRecord({ taskId: "t", status: "done", notifiedAt: 5_000 }));
+    // 顺序重删：第一次成功，第二次 missing（readTask=null → no-op）
+    assert.deepEqual(await store.deleteTask("t"), { deleted: true });
+    await assert.rejects(readFile(join(root, "tasks", "t.json"), "utf8"));
+    assert.deepEqual(await store.deleteTask("t"), { deleted: false, reason: "missing" });
+    // 并发双清：写回后 Promise.all 两个并发删除。每个结果要么 deleted:true 要么
+    // missing（后到者 readTask=null → no-op），绝不抛、绝不 not-terminal/unnotified。
+    await store.writeTask(fullRecord({ taskId: "t", status: "done", notifiedAt: 5_000 }));
+    const results = await Promise.all([store.deleteTask("t"), store.deleteTask("t")]);
+    for (const r of results) {
+      assert.ok(
+        r.deleted === true || (r.deleted === false && r.reason === "missing"),
+        `意外结果: ${JSON.stringify(r)}`,
+      );
+    }
+    assert.ok(results.some((r) => r.deleted === true), "至少一个并发删除成功");
+    await assert.rejects(readFile(join(root, "tasks", "t.json"), "utf8"));
+    assert.deepEqual(await readdir(join(root, "tasks")), []);
+  });
+});
+
+test("deleteTask：落盘复查时已非真终态（failed 且 attempts 未用尽→队列可复活）→ not-terminal，文件仍在", async () => {
+  await withStore(async (store, root) => {
+    await store.writeTask(fullRecord({ taskId: "rev", status: "done", notifiedAt: 5_000 }));
+    // 删除前被队列复活：覆写落盘为 retryable failed（attempts < maxAttempts，queue.ts:252）
+    await store.writeTask(
+      fullRecord({ taskId: "rev", status: "failed", attempts: 1, maxAttempts: 2 }),
+    );
+    assert.deepEqual(await store.deleteTask("rev"), { deleted: false, reason: "not-terminal" });
+    // 文件仍在、记录未被改动（谓词现读，读到的即 rm 前一刻状态）
+    assert.equal((await store.readTask("rev"))?.status, "failed");
+    await readFile(join(root, "tasks", "rev.json"), "utf8");
+  });
+});
+
+test("deleteTask：软链任务文件 → 删链接本身、目标文件原样保留（fs.rm 不跟随）", async () => {
+  await withStore(async (store, root) => {
+    await mkdir(join(root, "tasks"), { recursive: true });
+    const target = join(root, "target-outside.json");
+    const record = fullRecord({ taskId: "t", status: "done", notifiedAt: 5_000 });
+    await writeFile(target, JSON.stringify(record));
+    // tasks/t.json 是软链，指向 tasks 目录外的目标文件
+    await symlink(target, join(root, "tasks", "t.json"));
+    assert.equal((await store.readTask("t"))?.status, "done"); // 读侧跟随软链
+    assert.deepEqual(await store.deleteTask("t"), { deleted: true });
+    // 链接消失（tasks 目录空），目标文件原样保留
+    assert.deepEqual(await readdir(join(root, "tasks")), []);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), record);
+  });
+});
+
+test("deleteTask：真终态但守卫不过（notifiedAt=0 且 updatedAt 在 24h 补发窗内）→ unnotified，文件仍在", async () => {
+  await withStore(async (store, root) => {
+    const NOW = 1_700_000_000_000;
+    const HOUR = 3600 * 1000;
+    // done 但从未通知，1h 前完成（仍在缺省 24h 补发窗内，pin farm.ts:63）
+    await store.writeTask(
+      fullRecord({ taskId: "quiet", status: "done", notifiedAt: 0, updatedAt: NOW - HOUR }),
+    );
+    assert.deepEqual(await store.deleteTask("quiet", { now: NOW }), {
+      deleted: false,
+      reason: "unnotified",
+    });
+    // 文件仍在、未被改动
+    assert.equal((await store.readTask("quiet"))?.status, "done");
+    // 显式缩小补发窗（now - updatedAt > replayWindowMs，越过窗外）→ 守卫通过可删
+    assert.deepEqual(
+      await store.deleteTask("quiet", { now: NOW, replayWindowMs: HOUR / 2 }),
+      { deleted: true },
+    );
+    await assert.rejects(readFile(join(root, "tasks", "quiet.json"), "utf8"));
   });
 });
