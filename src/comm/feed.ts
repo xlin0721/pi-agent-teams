@@ -1,12 +1,12 @@
 // src/comm/feed.ts
 // comm 面板聚合视图（票 01）：5 列台账 + usage + 投递态 + 计数行，纯渲染零副作用。
 // 票 07 面板（setWidget）消费；票 04：active-only shown 源 + 行硬顶 100 + 折叠 +
-// footer 简化（即清 + 合计口径注记），recentN 废弃。本模块只 import node 内置之外的
-// 零依赖相对 .ts：
+// footer 简化（即清 + 合计口径注记）；票 08：recentN 复活为「最近完成 N 条」回显窗口
+// （终态完成即移出活跃行，仅以计数行回显）。本模块只 import node 内置之外的零依赖
+// 相对 .ts：
 //   - probe.ts 四个导出（FARM_STATUS_LABELS / durationText / sortTasksForDisplay /
-//     PANEL_MAX_ROWS）——probe.ts 的 padCell/spawnRole 是私有不可 import，feed 内本地
-//     padCell（列宽与 renderFarmTable 逐字对齐：8/12/8/8）。
-//   - task-core/cleanup.ts 的 splitTasksForDisplay（面板 active-only 谓词唯一源，与
+//     PANEL_MAX_ROWS）——feed 内本地 padCell（列宽 8/12/8/8，与表头列契约一致）。
+//   - task-core/cleanup.ts 的 splitTasksForDisplay（面板 active/recent 切分唯一源，与
 //     farm_status 工具侧零漂移，3a 白名单合法）。
 //   - steer.ts 的 pickLatest（投递态列取该 pane 最新消息）。
 
@@ -28,9 +28,11 @@ export interface FeedOptions {
   /** 时间锚（耗时/投递态）；缺省 Date.now() */
   now?: number;
   /**
-   * 已废弃（no-op，票 04）：面板 active-only 后不再按 recentN 截断——行硬顶/截断
-   * 统一归 05 的 splitTasksForDisplay 双截断。字段保留仅为 index.ts:1079 字面量
-   * 多余属性校验不报错（签名零变更，R1），05 接线后删除。
+   * 最近完成回显窗口（票 08）：recentN>0 时在 count/footer 行后追加一行小字
+   * 「最近完成 N 条」（N = splitTasksForDisplay(tasks, recentN).recent.length，即最近
+   * 终态窗口内条数；终态完成即移出活跃行，仅以计数回显，不挤占活跃行位）。
+   * recentN=0/缺省 → 不回显该行（输出形状与票 04 active-only 一致，活跃行渲染
+   * 不受 recentN 影响）。面板装配（index.ts refreshPanel）传 PANEL_RECENT_N=50。
    */
   recentN?: number;
   /** FE#4：行宽上限——usage/投递态列右向截断（省略号）；缺省 = 不截断 */
@@ -39,10 +41,10 @@ export interface FeedOptions {
   pricing?: PricingTable;
 }
 
-/** 前 5 列复用 renderFarmTable 语义（列宽/标签/耗时口径一致）+ usage/投递态两列。 */
+/** 前 5 列（8/12/8/8 列宽/状态标签/耗时口径 + usage/投递态两列）。 */
 const HEADER = "taskId   role         status   attempts 耗时 usage/费用 投递";
 
-/** 本地 padCell（probe.ts padCell 为私有；列宽与 renderFarmTable 逐字对齐）。 */
+/** 本地 padCell（列宽 8/12/8/8，与表头列契约一致）。 */
 function padCell(text: string, width: number): string {
   return text.length >= width ? text.slice(0, width) : text.padEnd(width);
 }
@@ -87,7 +89,7 @@ function deliveryCell(latest: InboxMessage | null): string {
   return `${latest.type}:${latest.status} @${latest.from}`;
 }
 
-/** 前 5 列（与 renderFarmTable 行逐字同宽：8/12/8/8 + durationText 尾列）。 */
+/** 前 5 列（列宽 8/12/8/8 + durationText 尾列，表头列契约）。 */
 function fiveCol(task: TaskRecord, now: number): string {
   const attempts = `${task.attempts}/${task.maxAttempts}`;
   return [
@@ -107,12 +109,12 @@ function truncateRight(text: string, maxWidth: number): string {
 }
 
 /**
- * 面板聚合视图（票 04）：表头 + 活跃任务行（shown 源 =
- * splitTasksForDisplay(tasks, 0).active + sortTasksForDisplay 定序；终态完成即不在
- * 面板）+ 行硬顶 PANEL_MAX_ROWS（超出折叠「另有 K 条排队」行，footer 前）+ footer
- * （活跃/排队计数 + 即清 + 合计口径静态注记；金额求和已移除，D3-A）。
- * presence 参数保留（签名兼容，不再消费存活计数）。返回 string[]（setWidget 行数组）。
- * 纯函数：不改任何输入。
+ * 面板聚合视图（票 04 + 票 08）：表头 + 活跃任务行（shown 源 = 活跃集 + 排序定序；
+ * 终态完成即不在活跃行）+ 行硬顶 PANEL_MAX_ROWS（超出折叠「另有 K 条排队」行，footer
+ * 前）+ footer（活跃/排队计数 + 即清 + 合计口径静态注记；金额求和已移除，D3-A）；
+ * recentN>0 时 footer 后再加一行小字「最近完成 N 条」回显（N = 最近终态窗口条数，
+ * 不挤占活跃行；recentN=0/缺省不出行）。presence 参数保留（签名兼容，不再消费存活
+ * 计数）。返回 string[]（setWidget 行数组）。纯函数：不改任何输入。
  */
 export function buildFeed(
   tasks: readonly TaskRecord[],
@@ -123,7 +125,13 @@ export function buildFeed(
 ): string[] {
   const now = opts.now ?? Date.now();
   const pricing = opts.pricing ?? DEFAULT_PRICING_TABLE;
-  const { active } = splitTasksForDisplay(tasks, 0);
+  // 最近完成回显窗口（票 08）：合法非负整数才生效（0/缺省 = 不回显行）；活跃集切分
+  // 与 recentN 无关（splitTasksForDisplay 的 active 恒为 queued/running/timeout）
+  const recentN =
+    typeof opts.recentN === "number" && Number.isInteger(opts.recentN) && opts.recentN >= 0
+      ? opts.recentN
+      : 0;
+  const { active, recent } = splitTasksForDisplay(tasks, recentN);
   const sorted = sortTasksForDisplay(active);
   const shown = sorted.slice(0, PANEL_MAX_ROWS);
   const maxWidth =
@@ -146,5 +154,9 @@ export function buildFeed(
   if (folded > 0) lines.push(`另有 ${folded} 条排队`);
   const queued = sorted.filter((task) => task.status === "queued").length;
   lines.push(`活跃 ${sorted.length} · 排队 ${queued} · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）`);
+  // 票 08：最近完成回显（footer 之后一行小字，不挤占活跃行；最近窗口为空则不出行）
+  if (recent.length > 0) {
+    lines.push(`最近完成 ${recent.length} 条 · 完成即移出活跃列表（详情见 farm_status）`);
+  }
   return lines;
 }

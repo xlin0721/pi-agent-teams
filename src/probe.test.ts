@@ -7,18 +7,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CliError } from "./display/split.ts";
 import type { TaskRecord } from "./task-core/store.ts";
-import type { TaskStatus } from "./task-core/states.ts";
 import {
   degradeRejectText,
   isL2Env,
   isPaneMode,
   listAgentRoles,
   ownDepth,
-  PANEL_MAX_ROWS,
   panelChanged,
   parseProbeResult,
   queuedPosition,
-  renderFarmTable,
   renderTaskDetail,
   resolveSpawnDepthForm,
   runProbe,
@@ -493,84 +490,3 @@ test("panelChanged: 空→空（非首拍）→ false", () => {
   assert.equal(panelChanged([], []), false);
 });
 
-// ── renderFarmTable（票 04：active-only + 硬顶 100 + 折叠 + 即清 footer） ───────
-
-const RENDER_NOW = 10_000;
-
-function renderRows(text: string): string[] {
-  return text.split("\n").slice(1, -1); // 去表头与 footer，仅任务行
-}
-
-/** 顺序任务（taskId 三位零填充，createdAt 递增；可显式指定 status 混入）。 */
-function sequencedTasks(count: number, statuses?: TaskStatus[]): TaskRecord[] {
-  return Array.from({ length: count }, (_, i) =>
-    makeTask({
-      taskId: `t${String(i + 1).padStart(3, "0")}`,
-      status: statuses?.[i] ?? "queued",
-      createdAt: i + 1,
-      attempts: statuses?.[i] === "failed" ? 2 : 0, // failed 用尽（2/2）= 真终态
-    }),
-  );
-}
-
-test("renderFarmTable: active-only——queued/running/timeout 渲染，终态行 0 条", () => {
-  const tasks = [
-    makeTask({ taskId: "q1", status: "queued", createdAt: 100 }),
-    makeTask({ taskId: "r1", status: "running", createdAt: 200 }),
-    makeTask({ taskId: "t1", status: "timeout", createdAt: 300 }),
-    makeTask({ taskId: "d1", status: "done", createdAt: 400 }),
-    makeTask({ taskId: "a1", status: "aborted", createdAt: 500 }),
-    makeTask({ taskId: "c1", status: "cancelled", createdAt: 600 }),
-    makeTask({ taskId: "f1", status: "failed", attempts: 2, maxAttempts: 2, createdAt: 700 }),
-  ];
-  const text = renderFarmTable(tasks, RENDER_NOW);
-  const lines = text.split("\n");
-  assert.equal(lines.length, 5); // 表头 + 3 活跃行 + footer
-  assert.deepEqual(
-    renderRows(text).map((l) => l.slice(0, 8).trim()),
-    ["q1", "r1", "t1"],
-  );
-  for (const terminal of ["d1", "a1", "c1", "f1"]) {
-    assert.ok(!text.includes(terminal), `终态 ${terminal} 不应在面板`);
-  }
-});
-
-test("renderFarmTable: 超 100 硬顶折叠——105 活跃 → 100 行 +「另有 5 条排队」+ footer，行序 createdAt ASC", () => {
-  const tasks = sequencedTasks(105, Array.from({ length: 105 }, (_, i) => (i < 100 ? "queued" : "running")));
-  const lines = renderFarmTable(tasks, RENDER_NOW).split("\n");
-  assert.equal(lines.length, 103); // 表头 + 100 行 + 折叠行 + footer
-  assert.deepEqual(
-    lines.slice(1, 1 + PANEL_MAX_ROWS).map((l) => l.slice(0, 8).trim()),
-    Array.from({ length: PANEL_MAX_ROWS }, (_, i) => `t${String(i + 1).padStart(3, "0")}`),
-  );
-  assert.equal(lines[101], "另有 5 条排队");
-  assert.equal(lines[102], "活跃 105 · 排队 100 · 任务执行完即可清理");
-});
-
-test("renderFarmTable: footer 文案——活跃/排队 +「任务执行完即可清理」（≤100 无折叠子句、无「另有」）", () => {
-  const tasks = [
-    makeTask({ taskId: "a1", status: "queued", createdAt: 1 }),
-    makeTask({ taskId: "b1", status: "running", createdAt: 2 }),
-    makeTask({ taskId: "c1", status: "timeout", createdAt: 3 }),
-  ];
-  const lines = renderFarmTable(tasks, RENDER_NOW).split("\n");
-  assert.equal(lines[lines.length - 1], "活跃 3 · 排队 1 · 任务执行完即可清理");
-  assert.ok(!lines.some((l) => l.includes("另有")), "≤100 无折叠行");
-});
-
-test("renderFarmTable: 空列表——保留表头 + footer（活跃 0 · 排队 0）", () => {
-  const lines = renderFarmTable([], RENDER_NOW).split("\n");
-  assert.deepEqual(lines, [
-    "taskId   role         status   attempts 耗时",
-    "活跃 0 · 排队 0 · 任务执行完即可清理",
-  ]);
-});
-
-test("renderFarmTable: 边界——恰 100 条无折叠行；queued 计数只计 status===\"queued\"；PANEL_MAX_ROWS=100 导出", () => {
-  const tasks = sequencedTasks(100, Array.from({ length: 100 }, (_, i) => (i % 2 === 0 ? "queued" : "timeout")));
-  const lines = renderFarmTable(tasks, RENDER_NOW).split("\n");
-  assert.equal(PANEL_MAX_ROWS, 100, "面板行硬顶常量（05 复用契约）");
-  assert.equal(lines.length, 102); // 表头 + 100 行 + footer（无折叠）
-  assert.ok(!lines.some((l) => l.includes("另有")), "恰 100 无折叠行");
-  assert.equal(lines[101], "活跃 100 · 排队 50 · 任务执行完即可清理");
-});

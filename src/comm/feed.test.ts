@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildFeed } from "./feed.ts";
 import type { UsageSidecar } from "../task-core/queue.ts";
-import { renderFarmTable } from "../probe.ts";
+import { durationText, FARM_STATUS_LABELS } from "../probe.ts";
 import type { TaskRecord } from "../task-core/store.ts";
 import type { TaskStatus } from "../task-core/states.ts";
 import type { InboxMessage } from "../task-core/steer.ts";
@@ -79,6 +79,24 @@ function inboxMsg(over: Partial<InboxMessage> = {}): InboxMessage {
   };
 }
 
+/** 5 列行前缀测试侧复刻（票 08 旧表格渲染删除后，宽度契约以表头为准：8/12/8/8 + 耗时尾列）。 */
+function padCell(text: string, width: number): string {
+  return text.length >= width ? text.slice(0, width) : text.padEnd(width);
+}
+function expectedFiveCol(task: TaskRecord, now: number): string {
+  const role = task.payload?.spawn?.role ?? "";
+  return [
+    padCell(task.taskId.slice(0, 8), 8),
+    padCell(role || "-", 12),
+    padCell(FARM_STATUS_LABELS[task.status] ?? String(task.status), 8),
+    padCell(`${task.attempts}/${task.maxAttempts}`, 8),
+    durationText(task, now),
+  ].join(" ");
+}
+
+/** 表头宽度契约（与 buildFeed 输出首行逐字一致；旧 5 列表格渲染已删）。 */
+const FIVE_COL_HEADER = "taskId   role         status   attempts 耗时";
+
 test("空 tasks：只有表头 + footer（活跃 0 · 排队 0 + 即清 + 合计口径注记）", () => {
   const feed = buildFeed([], [], [], new Map(), { now: NOW });
   assert.deepEqual(feed, [
@@ -87,22 +105,22 @@ test("空 tasks：只有表头 + footer（活跃 0 · 排队 0 + 即清 + 合计
   ]);
 });
 
-test("满列表：行序 createdAt 升序、5 列宽与 renderFarmTable 逐字对齐", () => {
+test("满列表：行序 createdAt 升序、5 列宽与表头列契约逐字对齐", () => {
   const t3 = makeTask({ taskId: "t3", createdAt: 3, startedAt: 1_000 });
   const t1 = makeTask({ taskId: "t1", createdAt: 1, startedAt: 1_000 });
   const t2 = makeTask({ taskId: "t2", createdAt: 2, startedAt: 1_000 });
 
   const feed = buildFeed([t3, t1, t2], [], [], new Map(), { now: NOW });
 
-  // 表头 = renderFarmTable 表头 + usage/投递两列
-  assert.equal(feed[0], renderFarmTable([], NOW).split("\n")[0] + " usage/费用 投递");
+  // 表头 = 5 列表头 + usage/投递两列
+  assert.equal(feed[0], `${FIVE_COL_HEADER} usage/费用 投递`);
   // 行序 createdAt 升序
   const order = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
   assert.deepEqual(order, ["t1", "t2", "t3"]);
-  // 每行前 5 列与 renderFarmTable 逐字一致（无 usage/paneId → "— —" 后缀）
-  assert.equal(feed[1], renderFarmTable([t1], NOW).split("\n")[1] + " — —");
-  assert.equal(feed[2], renderFarmTable([t2], NOW).split("\n")[1] + " — —");
-  assert.equal(feed[3], renderFarmTable([t3], NOW).split("\n")[1] + " — —");
+  // 每行 = 5 列前缀（宽度契约）+ " — —" 后缀（无 usage/paneId）
+  assert.equal(feed[1], `${expectedFiveCol(t1, NOW)} — —`);
+  assert.equal(feed[2], `${expectedFiveCol(t2, NOW)} — —`);
+  assert.equal(feed[3], `${expectedFiveCol(t3, NOW)} — —`);
 });
 
 test("usage 列：有 sidecar → ↑in ↓out；缺 sidecar → —", () => {
@@ -140,7 +158,7 @@ test("窄宽截断（FE#4）：长 usage/投递态右向截断加 …，前 5 �
   const snapshot = [
     inboxMsg({ status: "delivered", from: "a-very-long-sender-name", ts: 1 }),
   ];
-  const five = renderFarmTable([task], NOW).split("\n")[1];
+  const five = expectedFiveCol(task, NOW);
 
   const feed = buildFeed([task], [], snapshot, new Map([["t1", usage]]), {
     now: NOW,
@@ -153,11 +171,11 @@ test("窄宽截断（FE#4）：长 usage/投递态右向截断加 …，前 5 �
   assert.ok(row.startsWith(five + " "), "前 5 列不折行");
 });
 
-test("recentN 废弃 no-op（票 04）：传 recentN 不截断，全部活跃行渲染 + 无「显示最近」段", () => {
+test("recentN 窗口不影响活跃行（票 08）：全活跃无终态 → 无「最近完成」行，全部活跃行渲染不截断", () => {
   const tasks = [1, 2, 3, 4, 5].map((i) => makeTask({ taskId: `t${i}`, createdAt: i }));
   const feed = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN: 2 });
 
-  assert.equal(feed.length, 7); // 表头 + 5 活跃行 + footer
+  assert.equal(feed.length, 7); // 表头 + 5 活跃行 + footer（无终态 → 无最近完成行）
   const order = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
   assert.deepEqual(order, ["t1", "t2", "t3", "t4", "t5"]); // 全部活跃渲染（缺省 status=running）
   assert.equal(feed[6], "活跃 5 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
@@ -176,7 +194,7 @@ test("硬顶 PANEL_MAX_ROWS=100（票 04）：120 活跃缺省折叠为 100 行 
   assert.equal(feed[102], "活跃 120 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });
 
-test("recentN<=0（票 04 废弃 no-op 同款）：recentN 忽略，全部活跃渲染", () => {
+test("recentN<=0 不回显（票 08）：recentN=0 与缺省同款，全部活跃渲染 + 无最近完成行", () => {
   const tasks = [1, 2, 3].map((i) => makeTask({ taskId: `t${i}`, createdAt: i }));
   const feed = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN: 0 });
   assert.equal(feed.length, 5); // 表头 + 3 行 + footer
@@ -188,6 +206,85 @@ test("presence 不再入 footer（票 04 签名兼容）：存活计数不出现
   const expired = { taskId: "t2", paneId: "p2", role: "r", depth: 1, pid: 2, heartbeatAt: NOW - 20_000 };
   const feed = buildFeed([], [alive, expired], [], new Map(), { now: NOW });
   assert.equal(feed[1], "活跃 0 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+});
+
+// ── 票 08：面板「最近完成 N 条」回显（recentN 窗口，footer 后一行小字，不挤占活跃行） ────
+
+const RECENT_LINE = (n: number) => `最近完成 ${n} 条 · 完成即移出活跃列表（详情见 farm_status）`;
+
+test("票 08 最近完成回显：recentN>0 + 存在终态 → footer 后「最近完成 N 条」行（活跃行不挤占）", () => {
+  const active = [
+    makeTask({ taskId: "r1", status: "running", createdAt: 100 }),
+    makeTask({ taskId: "q1", status: "queued", createdAt: 200 }),
+  ];
+  const done = makeTask({ taskId: "d1", status: "done", createdAt: 300 });
+  const aborted = makeTask({ taskId: "a1", status: "aborted", createdAt: 400 });
+  const feed = buildFeed([...active, done, aborted], [], [], new Map(), { now: NOW, recentN: 5 });
+
+  // 表头 + 2 活跃行 + footer + 最近完成行（活跃行未被挤占/截断）
+  assert.equal(feed.length, 5);
+  assert.deepEqual(
+    feed.slice(1, 3).map((line) => line.slice(0, 8).trim()),
+    ["r1", "q1"],
+  );
+  assert.equal(feed[3], "活跃 2 · 排队 1 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+  assert.equal(feed[4], RECENT_LINE(2));
+  // 终态只在计数行回显，不渲染为任务行
+  for (const line of feed.slice(1, 3)) {
+    assert.ok(!line.includes("d1") && !line.includes("a1"), `终态不应占行：${line}`);
+  }
+});
+
+test("票 08 最近完成窗口截断：终态数 > recentN → N=窗口上限（末 recentN 条）", () => {
+  const terminals = [1, 2, 3, 4, 5].map((i) => makeTask({ taskId: `d${i}`, status: "done", createdAt: i }));
+  const feed = buildFeed(terminals, [], [], new Map(), { now: NOW, recentN: 3 });
+  // 全部终态 → 无活跃行：表头 + footer + 最近完成行（N=3 而非 5）
+  assert.equal(feed.length, 3);
+  assert.equal(feed[2], RECENT_LINE(3));
+});
+
+test("票 08 缺省/0 不回显：无 recentN 或 recentN=0 → 输出形状与既有（含终态也）一致", () => {
+  const tasks = [
+    makeTask({ taskId: "r1", status: "running", createdAt: 1 }),
+    makeTask({ taskId: "d1", status: "done", createdAt: 2 }),
+  ];
+  const def = buildFeed(tasks, [], [], new Map(), { now: NOW });
+  assert.equal(def.length, 3); // 表头 + 1 活跃行 + footer（无最近完成行）
+  assert.equal(def[2], "活跃 1 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+  const zero = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN: 0 });
+  assert.deepEqual(zero, def);
+});
+
+test("票 08 最近完成行与硬顶折叠共存：折叠行/footer 后仍追加最近行（终态不占活跃行，最近行恒尾行）", () => {
+  // 105 活跃（超 PANEL_MAX_ROWS=100 折叠）+ 2 终态：
+  // 布局 = 表头 + 100 活跃行 + 「另有 5 条排队」折叠行 + footer + 最近完成行
+  const active = Array.from({ length: 105 }, (_, i) =>
+    makeTask({ taskId: `a${String(i + 1).padStart(3, "0")}`, status: "queued", createdAt: i + 1 }),
+  );
+  const done = [
+    makeTask({ taskId: "d1", status: "done", createdAt: 200 }),
+    makeTask({ taskId: "d2", status: "done", createdAt: 300 }),
+  ];
+  const feed = buildFeed([...active, ...done], [], [], new Map(), { now: NOW, recentN: 50 });
+  assert.equal(feed.length, 104); // 表头 + 100 活跃行 + 折叠行 + footer + 最近完成行
+  assert.equal(feed[101], "另有 5 条排队"); // 折叠行在 footer 前
+  assert.equal(feed[102], "活跃 105 · 排队 105 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+  assert.equal(feed[103], RECENT_LINE(2)); // 最近完成行恒为尾行（footer 后）
+  for (const line of feed.slice(1, 101)) {
+    assert.ok(!line.includes("d1") && !line.includes("d2"), `终态不应占活跃行：${line}`);
+  }
+});
+
+test("票 08 非法 recentN 防御：负数/小数/NaN → 视同 0（不回显最近完成行、不抛错，输出与缺省一致）", () => {
+  const tasks = [
+    makeTask({ taskId: "r1", status: "running", createdAt: 1 }),
+    makeTask({ taskId: "d1", status: "done", createdAt: 2 }),
+  ];
+  const def = buildFeed(tasks, [], [], new Map(), { now: NOW });
+  for (const recentN of [-1, 2.5, Number.NaN]) {
+    const feed = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN });
+    assert.deepEqual(feed, def, `recentN=${recentN} 应视同 0（无最近完成行且不抛错）`);
+  }
 });
 
 // ── 票 05：成本列（定价经注入 PricingTable 行为断言） ─────────────────────────
@@ -259,7 +356,7 @@ test("costSourceFor：sidecar 与 result.cost 均无 → null（—）", () => {
 
 test("表头含 usage/费用", () => {
   const feed = buildFeed([], [], [], new Map(), { now: NOW });
-  assert.equal(feed[0], renderFarmTable([], NOW).split("\n")[0] + " usage/费用 投递");
+  assert.equal(feed[0], `${FIVE_COL_HEADER} usage/费用 投递`);
 });
 
 test("footer 恒含合计口径注记（票 04 D3-A）：静态文案不随任务费用增减；金额求和已删除", () => {

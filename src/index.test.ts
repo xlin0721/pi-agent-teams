@@ -19,7 +19,6 @@ import {
   FARM_STATUS_VALUES,
   durationText,
   formatNextAttemptAt,
-  renderFarmTable,
   renderTaskDetail,
   resumeCommandLine,
   sortTasksForDisplay,
@@ -77,70 +76,6 @@ const NOW = 10_000;
 // wireFarm 在 PI_AGENT_TEAMS_PANE 置位时退化为 no-op；本文件测试进程内禁用该环境变量
 // （node --test 每个测试文件独立进程，不影响其他文件）。
 delete process.env.PI_AGENT_TEAMS_PANE;
-
-// ── renderFarmTable（5 列表格） ─────────────────────────────────────────────
-
-test("renderFarmTable: 表头 5 列（taskId 前 8 位/role/status/attempts/耗时）+ 尾部「任务执行完即可清理」", () => {
-  const text = renderFarmTable([], NOW);
-  const lines = text.split("\n");
-  assert.equal(lines[0], "taskId   role         status   attempts 耗时");
-  assert.match(text, /活跃 0 · 排队 0 · 任务执行完即可清理/);
-});
-
-test("renderFarmTable: 行内容——taskId 前 8 位截断、role/status 标签、attempts 分数、耗时", () => {
-  const task = makeTask({
-    taskId: "abcdef1234567890",
-    status: "running",
-    startedAt: NOW - 1500,
-    attempts: 1,
-    maxAttempts: 2,
-    payload: {
-      ...makeTask().payload,
-      spawn: { ...makeTask().payload.spawn, role: "explorer" },
-    },
-  });
-  const lines = renderFarmTable([task], NOW).split("\n");
-  assert.equal(lines.length, 3); // 表头 + 1 行 + 尾部提示
-  const row = lines[1]!;
-  assert.ok(row.startsWith("abcdef12"), `taskId 前 8 位：${row}`);
-  assert.match(row, /explorer/);
-  assert.match(row, /运行中/);
-  assert.match(row, /1\/2/);
-  assert.match(row, /1\.5s/);
-});
-
-test("renderFarmTable: 耗时 startedAt 口径——未 started → —；running → now-startedAt；timeout（活态非终态）→ now-startedAt", () => {
-  const queued = makeTask({ taskId: "q1", status: "queued", startedAt: 0, createdAt: 100 });
-  const running = makeTask({ taskId: "r1", status: "running", startedAt: 6_000, updatedAt: 6_000, createdAt: 200 });
-  const timeout = makeTask({ taskId: "t1", status: "timeout", startedAt: 7_000, updatedAt: 7_000, createdAt: 300 });
-  // active-only（票 04）：done 终态不进面板；done 口径（updatedAt-startedAt）由下面
-  // 「durationText: 终态用 updatedAt 口径」用例（L246）直测覆盖。
-  const lines = renderFarmTable([queued, running, timeout], NOW).split("\n");
-  assert.equal(lines.length, 5); // 表头 + 3 活跃行 + footer
-  const qRow = lines[1]!;
-  const rRow = lines[2]!;
-  const tRow = lines[3]!;
-  assert.match(qRow, /—/);
-  assert.match(rRow, /4\.0s/);
-  assert.match(tRow, /3\.0s/);
-  assert.match(tRow, /超时/);
-  assert.match(lines[4]!, /活跃 3 · 排队 1 · 任务执行完即可清理/);
-});
-
-test("renderFarmTable: 行按 createdAt 升序（taskId 破序），role 缺失显示 -", () => {
-  const later = makeTask({ taskId: "b1", createdAt: 200 });
-  const earlier = makeTask({ taskId: "a1", createdAt: 100 });
-  const noRole = makeTask({
-    taskId: "c1",
-    createdAt: 300,
-    payload: { ...makeTask().payload, spawn: { ...makeTask().payload.spawn, role: "" } },
-  });
-  const lines = renderFarmTable([later, earlier, noRole], NOW).split("\n");
-  assert.match(lines[1]!, /a1/);
-  assert.match(lines[2]!, /b1/);
-  assert.match(lines[3]!, /c1/);
-  assert.match(lines[3]!, /-/);
-});
 
 test("sortTasksForDisplay: 不修改入参顺序（纯函数，返回新数组）", () => {
   const tasks = [makeTask({ taskId: "z", createdAt: 3 }), makeTask({ taskId: "a", createdAt: 1 })];
@@ -618,15 +553,43 @@ test("票 05 费用影响与四类文案（✅❌⏳⚠️）+ aborted 侧成本
   assert.match(region, /无可清理（真终态且已通知才可清；aborted 默认保留）/);
 });
 
-test("票 05 双截断统一：613 executeFarmStatus 与 1076 refreshPanel 均走 splitTasksForDisplay（读盘上界 ≤150）", async () => {
+test("票 08 polish：owner 分布 confirm/dry-run 同源（空 owner → (unknown) 归一）+ 未知模型成本注记 + 空选去重", async () => {
+  const region = await cleanupSrcRegion();
+  // ① owner 归一：dry-run 与 confirm 都走同一 countByOwner（空 owner → "(unknown)"）
+  assert.equal(
+    region.split("ownerSection(countByOwner(").length - 1,
+    2,
+    "dry-run 与 confirm 同用 countByOwner",
+  );
+  assert.match(region, /const owner = task\.owner === "" \? "\(unknown\)" : task\.owner;/);
+  assert.ok(!region.includes("ownerCount.set("), "confirm 不再手工 ownerCount 累加（归一归 countByOwner）");
+  assert.match(region, /const deletedTasks: TaskRecord\[\] = \[\];/);
+  // ② 成本未知：有成本数据但模型不在价目表 → 不静默计 0，注记「N 个任务成本未知」
+  assert.match(region, /function costUnknown\(task: TaskRecord, pricing: PricingTable\): boolean/);
+  assert.match(region, /return hasData && taskCostAmount\(task, pricing\) === null;/);
+  assert.match(region, /⚠️ \$\{unknownCost\} 个任务成本未知（模型不在价目表，未计入合计）/);
+  assert.equal(
+    region.split("costSection(cost, unknownCost, deps.pricing, deps.placeholder)").length - 1,
+    2,
+    "dry-run 与 confirm 都传 unknownCost 给 costSection",
+  );
+  // ③ 空选去重：deletable 为空时结果头即「无可清理」单表达（不再叠 ✅ 已清理 0 个 + 空态行）
+  assert.match(region, /const deletableEmpty = selection\.deletable\.length === 0;/);
+  assert.match(region, /✅ 无可清理：status 白名单（\$\{statusLabel\}）内无满足任务（真终态且已通知才可清；aborted 默认保留）/);
+  assert.equal(region.split("emptySection(").length - 1, 2, "emptySection 仅定义 + dry-run 调用（confirm 已去重）");
+});
+
+test("票 05 双截断统一：executeFarmStatus 与 refreshPanel 均走 splitTasksForDisplay（读盘上界 ≤150）", async () => {
   const src = await readIndexSrc();
-  // 613：executeFarmStatus 本地 renderFarmToolTable（弃用 probe.renderFarmTable 调用）
-  assert.ok(!src.includes("renderFarmTable("), "index.ts 不再调用 renderFarmTable（probe 保留不动）");
+  const probeSrc = await readFile(join(dirname(fileURLToPath(import.meta.url)), "probe.ts"), "utf8");
+  // executeFarmStatus 本地 renderFarmToolTable（票 08：旧 5 列表格渲染已从 probe 删除）
+  assert.ok(!src.includes("renderFarmTable"), "index.ts 无旧渲染引用");
+  assert.ok(!probeSrc.includes("renderFarmTable"), "probe.ts 已停用清理旧渲染（票 08）");
   assert.match(src, /renderFarmToolTable\(filtered, now\)/);
   assert.match(src, /splitTasksForDisplay\(filtered, PANEL_RECENT_N\)/);
   // 活跃硬顶 PANEL_MAX_ROWS 折叠
   assert.match(src, /activeSorted\.slice\(0, PANEL_MAX_ROWS\)/);
-  // 1076：refreshPanel shown 集 = 活跃硬顶 + 最近终态（读盘上界 ≤ 100 + 50 = 150，BE#5 保持）
+  // refreshPanel shown 集 = 活跃硬顶 + 最近终态（读盘上界 ≤ 100 + 50 = 150，BE#5 保持）
   assert.match(src, /splitTasksForDisplay\(tasks, PANEL_RECENT_N\)/);
   assert.match(src, /const shown = \[\.\.\.active\.slice\(0, PANEL_MAX_ROWS\), \.\.\.recent\];/);
   // PANEL_RECENT_N 保留 = recent 上界

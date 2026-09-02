@@ -13,7 +13,6 @@ import { classifyCliFailure } from "./display/protocol.ts";
 import { CliError } from "./display/split.ts";
 import { formatDurationMs } from "./display/format.ts";
 import { buildResumeArgs } from "./task-core/resume.ts";
-import { splitTasksForDisplay } from "./task-core/cleanup.ts";
 import type { TaskStatus } from "./task-core/states.ts";
 import type { TaskRecord } from "./task-core/store.ts";
 import type { UsageSidecar } from "./task-core/queue.ts";
@@ -370,41 +369,9 @@ export function durationText(task: TaskRecord, now: number): string {
   return formatDurationMs(Math.max(0, end - startedAt));
 }
 
-function padCell(text: string, width: number): string {
-  return text.length >= width ? text.slice(0, width) : text.padEnd(width);
-}
-
-/** 面板行数硬顶（票 04：active-only 超 100 折叠；probe/feed 共用，05 复用统一双截断）。 */
+/** 面板行数硬顶（票 04：active-only 超 100 折叠；probe/feed 共用，05 复用统一双截断）。
+ *  05 起 renderFarmToolTable（index.ts）替代原 5 列表格渲染，probe.ts 不再持有表格渲染。 */
 export const PANEL_MAX_ROWS = 100;
-
-/**
- * 5 列表格（纯渲染，US3）：taskId 前 8 位 / role / status / attempts / 耗时。
- * 只显示活跃任务（queued|running|timeout）：shown 源 = splitTasksForDisplay(tasks, 0)
- * .active（终态完成即不在面板），sortTasksForDisplay 定序（createdAt ASC + taskId 破序），
- * 行数硬顶 PANEL_MAX_ROWS——超出折叠为「另有 K 条排队」行（footer 前插入）；
- * footer 恒为「活跃 A · 排队 Q · 任务执行完即可清理」（A=活跃总数，Q=其中 queued 数；
- * 「任务执行完即可清理」= 即清语义）。空列表保留表头 + footer（A=Q=0）。
- */
-export function renderFarmTable(tasks: readonly TaskRecord[], now: number): string {
-  const { active } = splitTasksForDisplay(tasks, 0);
-  const sorted = sortTasksForDisplay(active);
-  const rows = sorted.slice(0, PANEL_MAX_ROWS).map((task) => {
-    const attempts = `${task.attempts}/${task.maxAttempts}`;
-    return [
-      padCell(task.taskId.slice(0, 8), 8),
-      padCell(spawnRole(task) || "-", 12),
-      padCell(FARM_STATUS_LABELS[task.status] ?? String(task.status), 8),
-      padCell(attempts, 8),
-      durationText(task, now),
-    ].join(" ");
-  });
-  const lines = ["taskId   role         status   attempts 耗时", ...rows];
-  const folded = sorted.length - PANEL_MAX_ROWS;
-  if (folded > 0) lines.push(`另有 ${folded} 条排队`);
-  const queued = sorted.filter((task) => task.status === "queued").length;
-  lines.push(`活跃 ${sorted.length} · 排队 ${queued} · 任务执行完即可清理`);
-  return lines.join("\n");
-}
 
 /** nextAttemptAt 渲染：0/缺失 → "—"；未到点附相对时长（退避可预期）。 */
 export function formatNextAttemptAt(nextAttemptAt: number, now: number): string {

@@ -621,7 +621,7 @@ async function executeFarmStatus(
   return { content: [{ type: "text", text: renderFarmToolTable(filtered, now) }] };
 }
 
-/** 本地 padCell（probe.ts padCell 为私有；列宽与 renderFarmTable 逐字对齐 8/12/8/8）。 */
+/** 本地 padCell（5 列宽 8/12/8/8，与表头列契约一致）。 */
 function padCell(text: string, width: number): string {
   return text.length >= width ? text.slice(0, width) : text.padEnd(width);
 }
@@ -631,7 +631,7 @@ function spawnRole(task: TaskRecord): string {
   return typeof role === "string" ? role : "";
 }
 
-/** 表格行（8/12/8/8 + durationText 尾列，与 renderFarmTable 行逐字同宽）。 */
+/** 表格行（8/12/8/8 + durationText 尾列，表头列契约）。 */
 function farmToolRow(task: TaskRecord, now: number): string {
   const attempts = `${task.attempts}/${task.maxAttempts}`;
   return [
@@ -644,7 +644,7 @@ function farmToolRow(task: TaskRecord, now: number): string {
 }
 
 /**
- * farm_status 工具侧渲染（票 05 双截断统一，弃用 probe.renderFarmTable）：
+ * farm_status 工具侧渲染（票 05 双截断统一；5 列表格唯一渲染，旧表格渲染 08 已删）：
  * splitTasksForDisplay(filtered, PANEL_RECENT_N) →「活跃」+「最近终态」两节——活跃硬顶
  * PANEL_MAX_ROWS 折叠（「另有 K 条排队」行），终态 50 上限（recent = createdAt 升序末
  * N 条）。--status done 等显式过滤时终态恢复显示。空列表保留计数行（footer）。
@@ -712,14 +712,29 @@ function parseCleanupStatuses(
   return { statuses };
 }
 
+/** result.cost 容错读取（终态任务成本字段；缺省全零/空串）。 */
+function resultCostFields(task: TaskRecord): { model: string; inputTokens: number; outputTokens: number } {
+  const cost = task.result?.cost;
+  return {
+    model: typeof cost?.model === "string" ? cost.model : "",
+    inputTokens: typeof cost?.inputTokens === "number" ? cost.inputTokens : 0,
+    outputTokens: typeof cost?.outputTokens === "number" ? cost.outputTokens : 0,
+  };
+}
+
 /** 单任务成本（仅计 result.cost；无有效字段 / 未知模型 → null）。 */
 function taskCostAmount(task: TaskRecord, pricing: PricingTable): number | null {
-  const cost = task.result?.cost;
-  const model = typeof cost?.model === "string" ? cost.model : "";
-  const inputTokens = typeof cost?.inputTokens === "number" ? cost.inputTokens : 0;
-  const outputTokens = typeof cost?.outputTokens === "number" ? cost.outputTokens : 0;
+  const { model, inputTokens, outputTokens } = resultCostFields(task);
   if (model === "" && inputTokens === 0 && outputTokens === 0) return null;
   return costAmount(pricing, model, inputTokens, outputTokens);
+}
+
+/** 成本未知判定（票 08）：有成本数据（model/token 任一有效）但模型不在价目表
+ *  （costAmount → null）→ true；无成本数据不算未知（不注记）。 */
+function costUnknown(task: TaskRecord, pricing: PricingTable): boolean {
+  const { model, inputTokens, outputTokens } = resultCostFields(task);
+  const hasData = model !== "" || inputTokens > 0 || outputTokens > 0;
+  return hasData && taskCostAmount(task, pricing) === null;
 }
 
 /** owner 分布（owner 空串 → "(unknown)"，确定性排序渲染）。 */
@@ -739,12 +754,18 @@ function ownerSection(ownerCount: ReadonlyMap<string, number>): string {
     : `owner 分布: ${parts.map(([owner, n]) => `${owner}: ${n}`).join("，")}`;
 }
 
-/** 费用影响行（getPricingTable 同源：result.cost → costAmount；aborted 侧成本不计入）。 */
-function costSection(cost: number, pricing: PricingTable, placeholder: boolean): string {
-  const line = `费用影响: 合计 ${formatCost(cost, pricing.currency)}（仅计 result.cost，aborted 侧成本不计入）`;
-  return placeholder
-    ? `${line}\n⚠️ 成本为占位价：请编辑 ~/.pi-agent-teams/pricing.json 校准（缺文件/坏 JSON 时回退默认价）`
-    : line;
+/** 费用影响行（getPricingTable 同源：result.cost → costAmount；aborted 侧成本不计入）。
+ *  unknownCost（票 08）：模型不在价目表而无法计价的任务数——成本未知不再静默计 0，
+ *  输出注记「N 个任务成本未知」；占位价注记保留。 */
+function costSection(cost: number, unknownCost: number, pricing: PricingTable, placeholder: boolean): string {
+  const lines = [`费用影响: 合计 ${formatCost(cost, pricing.currency)}（仅计 result.cost，aborted 侧成本不计入）`];
+  if (unknownCost > 0) {
+    lines.push(`⚠️ ${unknownCost} 个任务成本未知（模型不在价目表，未计入合计）`);
+  }
+  if (placeholder) {
+    lines.push("⚠️ 成本为占位价：请编辑 ~/.pi-agent-teams/pricing.json 校准（缺文件/坏 JSON 时回退默认价）");
+  }
+  return lines.join("\n");
 }
 
 /** skipped 分组（活跃/可复活/未通知；教学 ②：未通知是正常非 bug，稍后自动补发）。 */
@@ -782,7 +803,8 @@ function recheckLine(recheck: Record<DeleteSkipReason, number>): string | null {
  * 单源自 farm.ts；statuses 缺省 {done,cancelled,failed}，aborted 显式点名才并入；无时间
  * 下界）→ confirm=false 纯报告（dry-run 未删）｜true 逐条 store.deleteTask(taskId) 复查式
  * 删除（已复活/未通知→skipped；rm 异常→failed 计数）→ MECE 分节文本
- * （删除数+owner 分布 → 费用影响 → failed 计数 → skipped 分组 → 空态）。
+ * （结果行：删除数/无可清理 → owner 分布 → 费用影响 → failed 计数 → skipped 分组；
+ * 空选时结果行即「无可清理」单表达，不叠 ✅ 0 删除）。
  */
 async function executeCleanup(
   params: { status?: string; confirm?: boolean },
@@ -808,11 +830,12 @@ async function executeCleanup(
       (sum, task) => sum + (taskCostAmount(task, deps.pricing) ?? 0),
       0,
     );
+    const unknownCost = selection.deletable.filter((task) => costUnknown(task, deps.pricing)).length;
     const sections = [
       `⏳ farm_cleanup 报告（dry-run，未删除任何任务）——确认后带 --confirm 重跑。`,
       `可清理 ${total} 个（status 白名单: ${statusLabel}）`,
       ownerSection(countByOwner(selection.deletable)),
-      costSection(cost, deps.pricing, deps.placeholder),
+      costSection(cost, unknownCost, deps.pricing, deps.placeholder),
       skipSection(selection.skipped),
       emptySection(total),
     ].filter((line): line is string => line !== null && line !== "");
@@ -823,7 +846,8 @@ async function executeCleanup(
   let deleted = 0;
   let failed = 0;
   let cost = 0;
-  const ownerCount = new Map<string, number>();
+  let unknownCost = 0;
+  const deletedTasks: TaskRecord[] = []; // 实删集（owner 分布/未知成本与 dry-run 同口径，票 08）
   const recheck: Record<DeleteSkipReason, number> = { missing: 0, "not-terminal": 0, unnotified: 0 };
   const failedSamples: string[] = [];
   for (const task of selection.deletable) {
@@ -831,8 +855,9 @@ async function executeCleanup(
       const result = await deps.store.deleteTask(task.taskId);
       if (result.deleted) {
         deleted += 1;
+        deletedTasks.push(task);
         cost += taskCostAmount(task, deps.pricing) ?? 0;
-        ownerCount.set(task.owner, (ownerCount.get(task.owner) ?? 0) + 1);
+        if (costUnknown(task, deps.pricing)) unknownCost += 1;
       } else {
         recheck[result.reason] += 1;
       }
@@ -841,16 +866,20 @@ async function executeCleanup(
       if (failedSamples.length < 3) failedSamples.push(task.taskId.slice(0, 8));
     }
   }
+  // 空选去重（票 08）：deletable 为空（0 删除且无可清理）时只出「无可清理」一种表达，
+  // 不再叠「✅ 已清理 0 个」+ 空态行双表达
+  const deletableEmpty = selection.deletable.length === 0;
   const sections = [
-    `✅ 已清理 ${deleted} 个任务（status 白名单: ${statusLabel}）`,
-    ownerSection(ownerCount),
-    costSection(cost, deps.pricing, deps.placeholder),
+    deletableEmpty
+      ? `✅ 无可清理：status 白名单（${statusLabel}）内无满足任务（真终态且已通知才可清；aborted 默认保留）`
+      : `✅ 已清理 ${deleted} 个任务（status 白名单: ${statusLabel}）`,
+    ownerSection(countByOwner(deletedTasks)),
+    costSection(cost, unknownCost, deps.pricing, deps.placeholder),
     failed > 0
       ? `⚠️ ${failed} 个删除失败（已跳过）：${failedSamples.join(", ")}${failedSamples.length < failed ? " …" : ""}`
       : null,
     recheckLine(recheck),
     skipSection(selection.skipped),
-    emptySection(selection.deletable.length),
   ].filter((line): line is string => line !== null && line !== "");
   return { content: [{ type: "text", text: sections.join("\n") }] };
 }
