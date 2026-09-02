@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   FLUSH_WINDOW_MS,
+  GC_TASKS_TTL_MS,
   REPLAY_WINDOW_MS,
   aggregateEvents,
   buildDoneEvent,
@@ -30,12 +31,14 @@ import {
   isTerminalStatus,
   ownerProcessDead,
   parseOwnerPid,
+  sweepTasks,
   wireFarm,
 } from "./farm.ts";
 import type { DisplayClient, FarmDoneEvent, FarmDoneMessage, FarmPi, TerminalStatus } from "./farm.ts";
 import type { TaskStatus } from "./task-core/states.ts";
 import type { TaskRecord } from "./task-core/store.ts";
 import { TaskStore } from "./task-core/store.ts";
+import { selectTasksForCleanup } from "./task-core/cleanup.ts";
 import { Queue } from "./task-core/queue.ts";
 import type { Executor, StepReport } from "./task-core/queue.ts";
 
@@ -535,6 +538,15 @@ test("wireFarm gcEnabled:false → GC 不执行（25h 旧 usage 文件保留）�
   await writeFile(offFile, "{}");
   await utimes(offFile, old, old);
   const storeOff = new TaskStore(rootOff);
+  // 旧 done 任务（gcEnabled:false 全局关 GC → 即使超期也不 sweep）
+  await storeOff.writeTask(
+    taskRecord({
+      taskId: "gc-off-task",
+      status: "done",
+      notifiedAt: FIXED - 25 * 3600 * 1000,
+      updatedAt: FIXED - 25 * 3600 * 1000,
+    }),
+  );
   const loopOff = wireFarm({
     queue: idleQueue(storeOff),
     display: { spawn: async () => "1", listPanes: async () => [], kill: async () => {}, killSync: () => {} },
@@ -551,6 +563,7 @@ test("wireFarm gcEnabled:false → GC 不执行（25h 旧 usage 文件保留）�
   await new Promise((resolve) => setTimeout(resolve, 50)); // 多轮 probe 周期
   await loopOff.stop();
   assert.equal(await readFile(offFile, "utf8"), "{}", "gcEnabled:false 不得 sweep");
+  assert.notEqual(await storeOff.readTask("gc-off-task"), null, "gcEnabled:false 下 tasks 亦不 sweep");
 
   // ② 缺省 gcEnabled（true）：同构造旧 usage 文件被 sweep
   const rootOn = await mkdtemp(join(tmpdir(), "pi-agent-teams-gc-on-"));
@@ -601,7 +614,7 @@ test("gcOnce 三目录 sweep：inbox/usage/presence 24h 旧文件全删、fresh 
   await utimes(join(root, "presence", "old.json"), old, old);
   await utimes(join(root, "presence", "fresh.json"), fresh, fresh);
 
-  await gcOnce(root, now);
+  await gcOnce(root, now, new TaskStore(root));
 
   // 三目录 old 全删、fresh 全留；inbox 同 pane 目录内 fresh 保留（逐文件级，非目录整删）
   await assert.rejects(readFile(join(inboxPane, "old.json"), "utf8"));
@@ -996,4 +1009,199 @@ test("tripwire：slow spawn × 短 drain 超时——stop 返回后迟到 spawn 
   const rec = await store.readTask("t-drain");
   assert.equal(rec?.status, "cancelled");
   assert.equal(rec?.payload.spawn.paneId, "", "写回被 skip：陈旧 paneId 不覆盖 cancelled");
+});
+
+// ── 票 03：GC 兜底 sweepTasks + timeout 僵尸回收 ──
+
+test("sweepTasks TTL 边界：恰 24h 不删 / +1ms 删 / 未通知 age<24h 守卫先行跳过", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-ttl-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new TaskStore(root);
+  const now = 3_000_000_000_000;
+  const H = 3600 * 1000;
+  // 已通知 done，updatedAt 恰 24h 前 → TTL 严格 > 不过 → 不删
+  await store.writeTask(
+    taskRecord({ taskId: "eq24", status: "done", notifiedAt: now - 1000, updatedAt: now - 24 * H }),
+  );
+  // 已通知 done，updatedAt 24h+1ms 前 → 删
+  await store.writeTask(
+    taskRecord({ taskId: "gt24", status: "done", notifiedAt: now - 1000, updatedAt: now - 24 * H - 1 }),
+  );
+  // 未通知 done，age 20h（<24h 补发窗）→ 守卫（unnotified）先行跳过 → 不删
+  await store.writeTask(
+    taskRecord({ taskId: "un20", status: "done", notifiedAt: 0, updatedAt: now - 20 * H }),
+  );
+  // 未通知 done，age 24h+1ms（已越补发窗）→ 守卫过 + TTL 过 → 删
+  await store.writeTask(
+    taskRecord({ taskId: "un24p", status: "done", notifiedAt: 0, updatedAt: now - 24 * H - 1 }),
+  );
+
+  const r = await sweepTasks(store, now);
+  assert.deepEqual(r, { deleted: 2, failed: 0 });
+  assert.notEqual(await store.readTask("eq24"), null, "恰 24h 不删（严格 >）");
+  assert.equal(await store.readTask("gt24"), null, "+1ms 删");
+  assert.notEqual(await store.readTask("un20"), null, "未通知 age<24h：守卫先行跳过");
+  assert.equal(await store.readTask("un24p"), null, "未通知越补发窗 + 越 TTL → 删");
+});
+
+test("sweepTasks 守卫/真终态：done+已通知超期删；failed 可复活、timeout/queued/running/aborted、恰 24h 不删", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-guard-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new TaskStore(root);
+  const now = 3_000_000_000_000;
+  const H = 3600 * 1000;
+  const old = now - 25 * H; // 超期（>24h）
+  await store.writeTask(taskRecord({ taskId: "d-del", status: "done", notifiedAt: now - 1000, updatedAt: old }));
+  await store.writeTask(taskRecord({ taskId: "d-eq", status: "done", notifiedAt: now - 1000, updatedAt: now - 24 * H }));
+  await store.writeTask(
+    taskRecord({ taskId: "f-retry", status: "failed", attempts: 1, maxAttempts: 2, notifiedAt: now - 1000, updatedAt: old }),
+  );
+  await store.writeTask(taskRecord({ taskId: "t-timeout", status: "timeout", updatedAt: old }));
+  await store.writeTask(taskRecord({ taskId: "q-queued", status: "queued", updatedAt: old }));
+  await store.writeTask(taskRecord({ taskId: "r-running", status: "running", updatedAt: old }));
+  await store.writeTask(taskRecord({ taskId: "a-aborted", status: "aborted", notifiedAt: now - 1000, updatedAt: old }));
+  await store.writeTask(taskRecord({ taskId: "d-un24", status: "done", notifiedAt: 0, updatedAt: now - 24 * H }));
+
+  const r = await sweepTasks(store, now);
+  assert.deepEqual(r, { deleted: 1, failed: 0 }, "仅 d-del 可删");
+  assert.equal(await store.readTask("d-del"), null);
+  for (const kept of ["d-eq", "f-retry", "t-timeout", "q-queued", "r-running", "a-aborted", "d-un24"]) {
+    assert.notEqual(await store.readTask(kept), null, `${kept} 不应删`);
+  }
+});
+
+test("sweepTasks 单文件失败跳过：deleteTask 抛错 → 其余继续、gcOnce 不 throw、failed 计数透出", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-failskip-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const real = new TaskStore(root);
+  const now = 3_000_000_000_000;
+  const old = now - 25 * 3600 * 1000;
+  await real.writeTask(taskRecord({ taskId: "boom", status: "done", notifiedAt: now - 1000, updatedAt: old }));
+  await real.writeTask(taskRecord({ taskId: "ok", status: "done", notifiedAt: now - 1000, updatedAt: old }));
+  const store = {
+    scanTasks: (owner?: string | null) => real.scanTasks(owner),
+    readTask: (id: string) => real.readTask(id),
+    writeTask: (rec: TaskRecord) => real.writeTask(rec),
+    deleteTask: async (taskId: string, opts?: { now?: number }) => {
+      if (taskId === "boom") throw new Error("simulated delete failure");
+      return real.deleteTask(taskId, opts);
+    },
+  } as unknown as TaskStore;
+
+  const r = await sweepTasks(store, now);
+  assert.deepEqual(r, { deleted: 1, failed: 1 }, "ok 删、boom 失败计数");
+  assert.notEqual(await real.readTask("boom"), null, "抛错任务保留（rm 未执行）");
+  assert.equal(await real.readTask("ok"), null);
+
+  // 再次 sweep 仍不抛（重复执行幂等）；gcOnce 全链亦不 throw（boom 仍计数失败）
+  await sweepTasks(store, now);
+  await gcOnce(root, now, store);
+  assert.notEqual(await real.readTask("boom"), null, "gcOnce 吞掉单条失败，boom 仍在");
+});
+
+test("wireFarm 装配：死 owner timeout（attempts==max）→ reap 落 failed + replay 补发 → 越过 TTL sweep 删（僵尸回收全链）", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-ztimeout-"));
+  const deadPid = await deadChildPid();
+  const store = new TaskStore(root);
+  const { messages, killSyncCalls, loop } = wireHarness(root, { queue: idleQueue(store), store });
+  t.after(async () => {
+    await loop.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const now = Date.now();
+  // 僵尸：崩溃主会话遗留的死 owner timeout，attempts 已用尽（exhausted → failed 为真终态）
+  const zombie = taskRecord({
+    taskId: "z-timeout",
+    status: "timeout",
+    owner: `${deadPid}+${now}`,
+    attempts: 2,
+    maxAttempts: 2,
+    updatedAt: now - 60_000,
+    notifiedAt: 0,
+  });
+  zombie.payload.spawn.paneId = "p-ztimeout";
+  await store.writeTask(zombie);
+  // 活 owner 的 timeout（另一会话仍活）→ 不动（下次会话 retry 自然接管）
+  await store.writeTask(
+    taskRecord({ taskId: "alive-timeout", status: "timeout", owner: `${process.pid}+${now}`, updatedAt: now - 60_000 }),
+  );
+
+  await loop.start();
+
+  // reap：killSync 僵尸 pane + timeout×exhausted → failed（attempts 强制 = maxAttempts）
+  await waitFor(async () => (await store.readTask("z-timeout"))?.status === "failed");
+  assert.deepEqual(killSyncCalls, ["p-ztimeout"], "死 owner timeout 僵尸 pane 被 killSync；活 owner 不杀");
+  const reaped = await store.readTask("z-timeout");
+  assert.equal(reaped?.attempts, 2, "attempts 强制 = maxAttempts（本用例 attempts==max 已用尽）");
+  // notifiedAt 原样不可直接观测：reap→replay 在同一 session_start 顺序执行，waitFor 看到
+  // failed 时补发可能已完成并写回 notifiedAt——「未通知才补发」由下方 farm.done 送达断言证明
+  // （filterReplay 硬性要求 notifiedAt=0，能收到 farm.done 即证 reap 落盘时未通知）。
+  assert.equal((await store.readTask("alive-timeout"))?.status, "timeout", "活 owner timeout 不动");
+
+  // replay：failed + 未通知 + 死 owner → 补发 farm.done（status=failed，无 reason 字段）
+  await waitFor(() => messages.some((m) => m.events.some((e) => e.taskId === "z-timeout")), 1500);
+  const ev = messages.flatMap((m) => m.events).find((e) => e.taskId === "z-timeout")!;
+  assert.equal(ev.status, "failed");
+
+  // 补发后 notifiedAt 写回（防每次重启重复补发）
+  await waitFor(async () => (await store.readTask("z-timeout"))?.notifiedAt! > 0);
+
+  // mock 越过 TTL：gcOnce(sweep) 复查式删除（已通知 + age>24h → 删）
+  const afterReap = (await store.readTask("z-timeout"))!;
+  await gcOnce(root, afterReap.updatedAt + GC_TASKS_TTL_MS + 1, store);
+  assert.equal(await store.readTask("z-timeout"), null, "越过 TTL 后 sweep 删僵尸落盘的 failed 任务");
+});
+
+test("wireFarm 装配：死 owner timeout（attempts=1<max=2）→ reap 强制 attempts=maxAttempts → cleanup 归 deletable → 越过 TTL sweep 删（僵尸链 attempts<max 子类）", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-t-zsubmax-"));
+  const deadPid = await deadChildPid();
+  const store = new TaskStore(root);
+  const { messages, killSyncCalls, loop } = wireHarness(root, { queue: idleQueue(store), store });
+  t.after(async () => {
+    await loop.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const now = Date.now();
+  // 僵尸：崩溃主会话遗留的死 owner timeout，attempts=1 < maxAttempts=2（中途崩溃，未用尽）
+  const zombie = taskRecord({
+    taskId: "z-submax",
+    status: "timeout",
+    owner: `${deadPid}+${now}`,
+    attempts: 1,
+    maxAttempts: 2,
+    updatedAt: now - 60_000,
+    notifiedAt: 0,
+  });
+  zombie.payload.spawn.paneId = "p-zsubmax";
+  await store.writeTask(zombie);
+
+  await loop.start();
+
+  // reap：killSync 僵尸 pane + timeout×exhausted → failed，attempts 强制 = maxAttempts（2）
+  await waitFor(async () => (await store.readTask("z-submax"))?.status === "failed");
+  assert.deepEqual(killSyncCalls, ["p-zsubmax"], "死 owner timeout 僵尸 pane 被 killSync");
+  const reaped = await store.readTask("z-submax");
+  assert.equal(reaped?.attempts, 2, "reap 后 attempts 强制 = maxAttempts（owner 已死 retry 永不发生）");
+  assert.equal(reaped?.status, "failed");
+
+  // 补发 farm.done：status=failed 与落盘终态一致；事件无 reason 字段（按 status 语义消费）
+  await waitFor(() => messages.some((m) => m.events.some((e) => e.taskId === "z-submax")), 1500);
+  const ev = messages.flatMap((m) => m.events).find((e) => e.taskId === "z-submax")!;
+  assert.equal(ev.status, "failed");
+  assert.equal(Object.hasOwn(ev, "reason"), false, "farm.done 事件无 reason 字段（attemptsExhausted 不落在通知上）");
+
+  // 补发后 notifiedAt 写回（防每次重启重复补发）
+  await waitFor(async () => (await store.readTask("z-submax"))?.notifiedAt! > 0);
+
+  // 僵尸链闭环：attempts==maxAttempts → cleanup 归 deletable 而非 retryable（修复前归 retryable 永不清）
+  const sel = selectTasksForCleanup(await store.scanTasks(null), Date.now(), { replayWindowMs: REPLAY_WINDOW_MS });
+  assert.equal(sel.skipped.retryable.some((t) => t.taskId === "z-submax"), false, "不再归 retryable（死 owner 无复活源）");
+  assert.equal(sel.deletable.some((t) => t.taskId === "z-submax"), true, "归 deletable（真终态 + 已通知）");
+
+  // mock 越过 TTL：gcOnce(sweep) 复查式删除（已通知 + age>24h → 删）
+  const afterReap = (await store.readTask("z-submax"))!;
+  await gcOnce(root, afterReap.updatedAt + GC_TASKS_TTL_MS + 1, store);
+  assert.equal(await store.readTask("z-submax"), null, "越过 TTL 后 sweep 删 attempts<max 子类僵尸");
 });

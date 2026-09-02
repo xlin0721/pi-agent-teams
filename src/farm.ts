@@ -29,7 +29,7 @@
 //   泄漏；上限 busyDrainTimeoutMs 可注入、默认 5s，挂死 step 不拖垮 shutdown）→
 //   killSync 同步全 kill 本会话 running/timeout pane（spawnSync 实现，防异步
 //   fire-and-forget 进程退出前未完成；timeout 任务只 kill 不迁移状态，下次会话
-//   retry 自然接管；kill 不删 session 文件，sessions 由 GC 7d 口径回收）+ running/
+//   retry 自然接管；kill 不删 session 文件，sessions 由 GC 3d 口径回收）+ running/
 //   queued cancelled 落盘（每任务落盘前 readTask 现读，防 stale 快照整记录写回
 //   clobber 并发 spawn 写回的 paneId）。queue.ts 无 cancel 入口：cancel 迁移边由
 //   states.ts transition 提供（running×cancel / queued×cancel → cancelled），farm 调
@@ -37,8 +37,9 @@
 //   no-ticker 窗口语义：双扫返回后 shutdown 路径再无扫描/取消动作——此后 spawn 工具
 //   新入队的 queued 任务不被 cancel/kill（queued 无 pane 可杀），留盘到下会话
 //   session_start 由 Queue.step 正常出队（owner 不变即接续）。
-// - GC：挂探测循环顺带执行（≥60s 节流），v2 口径 requests 1h/status 24h/sessions 7d/
-//   hb 24h/log 7d。
+// - GC：挂探测循环顺带执行（≥60s 节流），v2 口径 requests 1h/status 24h/sessions 3d/
+//   hb 24h/log 3d；tasks 真终态 24h 兜底（主动清理为常态 + 通知守卫，aborted 默认
+//   排除保留人工 resume）。
 //
 // 依赖纪律：零 pi SDK import——pi/display/notify 全部本文件声明结构性接口（T6 装配时
 // 以真实 ExtensionAPI/04 display 实现对接，无需运行时依赖）；运行时 import 仅 node:
@@ -51,7 +52,8 @@ import { readdir, rm, stat } from "node:fs/promises";
 import { transition } from "./task-core/states.ts";
 import type { TaskStatus } from "./task-core/states.ts";
 import { buildResumeArgs, findSessionId } from "./task-core/resume.ts";
-import type { TaskRecord } from "./task-core/store.ts";
+import type { TaskRecord, TaskStore } from "./task-core/store.ts";
+import { selectTasksForCleanup } from "./task-core/cleanup.ts";
 import type { Queue, StepReport } from "./task-core/queue.ts";
 import { formatDurationMs } from "./display/format.ts";
 
@@ -65,12 +67,14 @@ export const REPLAY_WINDOW_MS = 24 * 3600 * 1000;
 export const GC_REQUESTS_TTL_MS = 3600 * 1000;
 /** GC 口径：status 信号文件 24h */
 export const GC_STATUS_TTL_MS = 24 * 3600 * 1000;
-/** GC 口径：sessions 目录 7d（kill 不删 session 文件，回收归 GC） */
-export const GC_SESSIONS_TTL_MS = 7 * 24 * 3600 * 1000;
+/** GC 口径：sessions 目录 3d（kill 不删 session 文件，回收归 GC） */
+export const GC_SESSIONS_TTL_MS = 3 * 24 * 3600 * 1000;
 /** GC 口径：心跳 wrapper-*.hb 24h（v2 残留，v3 wrapper 不写 hb） */
 export const GC_HB_TTL_MS = 24 * 3600 * 1000;
-/** GC 口径：日志 wrapper-*.log 7d（v2 残留） */
-export const GC_LOG_TTL_MS = 7 * 24 * 3600 * 1000;
+/** GC 口径：日志 wrapper-*.log 3d（v2 残留） */
+export const GC_LOG_TTL_MS = 3 * 24 * 3600 * 1000;
+/** GC 口径：tasks 真终态 24h 兜底（主动清理为常态 + 通知守卫；数值 pin = REPLAY_WINDOW_MS） */
+export const GC_TASKS_TTL_MS = 24 * 3600 * 1000;
 const GC_THROTTLE_MS = 60_000;
 const DEFAULT_TICK_MS = 400;
 const DEFAULT_PROBE_MS = 3000;
@@ -113,7 +117,7 @@ function finiteMs(value: unknown): number {
 /**
  * task record → 通知事件（纯）。终态校验：非终态抛 TypeError。
  * resumeArgs 仅 aborted/cancelled 附带，且需 sessionDir 非空 + sessionId 可解析
- * （kill 不删 session 文件，sessions 目录保留至 GC 7d，恢复数据齐备）。
+ * （kill 不删 session 文件，sessions 目录保留至 GC 3d，恢复数据齐备）。
  */
 export function buildDoneEvent(task: TaskRecord, sessionId: string | null): FarmDoneEvent {
   const status = task.status;
@@ -778,25 +782,47 @@ async function replay(ctx: FarmContext): Promise<void> {
  * 接管写者。释放全局 running 并发位（跨 owner 共享上限）。aborted 为终态 + 未通知
  * → 随后 replay 补发 farm.done（附恢复命令）。存活探测用默认 process.kill(pid,0)
  * （真实 pid 表；owner 不可解析/仍活 → 不动）。
+ *
+ * timeout 分支（票 03）：owner 进程已死的 timeout 任务同闸接管——先 killSync 僵尸
+ * pane，再经 timeout×exhausted → failed 终态（states.ts 既有迁移行，零新表行；
+ * notifiedAt 保持 0，attempts 强制 = maxAttempts：owner 已死 retry 永不发生，标记
+ * 用尽符合事实）。失败 owner 的 timeout 无活会话 retry，不回收即永存；attempts 用尽
+ * 后 cleanup 归 deletable 而非 retryable（僵尸链闭环）。exhausted 化后
+ * failed+未通知+死 owner → 随后 replay 补发 farm.done（status=failed；通知无 reason
+ * 字段——states.ts notifyMain 的 attemptsExhausted 不落在 farm.done 上，按 status
+ * 语义消费），送达后 notifiedAt 写回链入 GC 守卫。
  */
 async function reapDeadOwnerRunnings(ctx: FarmContext): Promise<void> {
   const all = await ctx.cfg.queue.store.scanTasks(null);
   const now = ctx.cfg.now();
   for (const task of all) {
-    if (task.status !== "running") continue;
+    if (task.status !== "running" && task.status !== "timeout") continue;
     if (task.owner === ctx.cfg.owner) continue;
     if (!ownerProcessDead(task.owner)) continue;
     try {
       const paneId = task.payload?.spawn?.paneId ?? "";
       if (paneId !== "") {
         try {
-          ctx.cfg.display.killSync(paneId); // 先杀僵尸 pane（best-effort）再落 aborted
+          ctx.cfg.display.killSync(paneId); // 先杀僵尸 pane（best-effort）再落终态
         } catch {
-          // kill 失败不挡 aborted 落盘
+          // kill 失败不挡落盘
         }
       }
-      const result = transition(task.status, "paneAborted");
-      await ctx.cfg.queue.store.writeTask({ ...task, status: result.next, updatedAt: now });
+      if (task.status === "timeout") {
+        // 死 owner timeout → exhausted → failed（reap 内不直接 notify，补发归 replay）
+        // attempts 强制 = maxAttempts：与队列 exhausted 前置（attempts≥max）对齐，
+        // 防 failed+attempts<max → cleanup 归 retryable 永不清（🔴#3 僵尸链）
+        const result = transition("timeout", "exhausted");
+        await ctx.cfg.queue.store.writeTask({
+          ...task,
+          status: result.next,
+          updatedAt: now,
+          attempts: task.maxAttempts,
+        });
+      } else {
+        const result = transition(task.status, "paneAborted");
+        await ctx.cfg.queue.store.writeTask({ ...task, status: result.next, updatedAt: now });
+      }
     } catch {
       // 单任务失败不挡其余
     }
@@ -838,19 +864,54 @@ async function gcIfDue(ctx: FarmContext): Promise<void> {
   const now = ctx.cfg.now();
   if (s.lastGcAt !== 0 && now - s.lastGcAt < GC_THROTTLE_MS) return;
   s.lastGcAt = now;
-  await gcOnce(ctx.cfg.farmRoot, now);
+  await gcOnce(ctx.cfg.farmRoot, now, ctx.cfg.queue.store);
 }
 
 /**
- * GC（v2 口径，挂探测循环顺带执行）：requests 1h / status 24h / sessions 7d /
- * inbox 24h（逐文件级）/ usage 24h / presence 24h / wrapper-*.hb 24h /
- * wrapper-*.log 7d。全 best-effort（目录缺失/单文件失败跳过）。
- * 注意 tasks/ 不在 GC 清单（farm_status/补发数据源，口径调整另议）。
+ * tasks/ 兜底 sweep（GC 清单新条目；含 I/O，故在 farm 层而非纯逻辑 cleanup.ts）：
+ * 全量快照 scanTasks(null) → 票 02 selectTasksForCleanup（真终态 + 通知守卫，白名单
+ * done/cancelled/failed——aborted 默认排除保留人工 resume）→ 叠加 GC_TASKS_TTL_MS
+ * 年龄过滤（now - updatedAt 严格 >，与通知守卫 D-A 同口径：恰 = 24h 仍在补发窗/TTL
+ * 边内不删）→ 逐条 store.deleteTask 复查式删除（readTask 现读重验谓词 + rm 幂等，
+ * 防快照与删除间竞态）。单条失败（deleteTask 抛错或复查跳过）catch 记 failed 计数
+ * 不抛、不断链（镜像 sweepInbox 纪律）。
+ * 导出（非私有）仅供单测观测 failed 计数；消费方 = gcOnce（位置：sessions 之后）。
  */
-export async function gcOnce(root: string, now: number): Promise<void> {
+export async function sweepTasks(
+  store: TaskStore,
+  now: number,
+): Promise<{ deleted: number; failed: number }> {
+  const all = await store.scanTasks(null);
+  const selection = selectTasksForCleanup(all, now, {
+    replayWindowMs: REPLAY_WINDOW_MS,
+    statuses: new Set<TaskStatus>(["done", "cancelled", "failed"]),
+  });
+  let deleted = 0;
+  let failed = 0;
+  for (const task of selection.deletable) {
+    if (!(now - task.updatedAt > GC_TASKS_TTL_MS)) continue; // 严格 >：恰 24h 不删
+    try {
+      const result = await store.deleteTask(task.taskId, { now });
+      if (result.deleted) deleted += 1;
+      else failed += 1; // 复查跳过（missing/not-terminal/unnotified）计入 failed 不抛
+    } catch {
+      failed += 1; // 单条失败跳过不挡其余
+    }
+  }
+  return { deleted, failed };
+}
+
+/**
+ * GC（v2 口径，挂探测循环顺带执行）：requests 1h / status 24h / sessions 3d /
+ * inbox 24h（逐文件级）/ usage 24h / presence 24h / wrapper-*.hb 24h /
+ * wrapper-*.log 3d；tasks 真终态 24h 兜底（见 sweepTasks）。全 best-effort（目录
+ * 缺失/单文件失败跳过）。store 必选 = sweepTasks 数据源（gcIfDue 传 ctx.cfg.queue.store）。
+ */
+export async function gcOnce(root: string, now: number, store: TaskStore): Promise<void> {
   await sweepDir(join(root, "requests"), now, GC_REQUESTS_TTL_MS, (name) => /\.agent-prompt$/.test(name), false);
   await sweepDir(join(root, "status"), now, GC_STATUS_TTL_MS, (name) => /\.(done|aborted)$/.test(name), false);
   await sweepDir(join(root, "sessions"), now, GC_SESSIONS_TTL_MS, () => true, true);
+  await sweepTasks(store, now);
   await sweepInbox(join(root, "inbox"), now);
   // usage/presence 均含原子写 .tmp（wrapper tmp+mv / presence tmp+rename）——rename 前崩溃
   // 即残留，故 matcher 需一并回收 .tmp，防无限堆积。
