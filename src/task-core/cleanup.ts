@@ -3,14 +3,17 @@
 //
 // 依据：.scratch/task-cleanup/spec.md v3 §二/§五.2 + 票 02 已批准 Plan（ba315aafb059/6c76c73b-4f9）。
 // 关键规则：
-//   - 纯逻辑、零 I/O、零 SDK、零运行时依赖：仅 import type（node 22 type-stripping 下被完整擦除）。
+//   - 纯逻辑、零 I/O、零 SDK：运行时依赖仅 task-core 共享常量 constants.ts（纯数值）；
+//     其余 import type（node 22 type-stripping 下被完整擦除）。
 //   - isTrulyTerminal 与 queue.ts:252 retry 判据（failed && attempts<maxAttempts）逐字互否：
 //     清理/GC 所选 deletable 中不存在即将被队列复活的任务。
-//   - 通知守卫（PRD §4.9）：notifiedAt>0（已确认）或已越过补发窗（严格 > 才可清，D-A）。
+//   - 通知守卫（PRD §4.9）：有限正数 notifiedAt（非有限如 Infinity/NaN 视为未通知，
+//     与 farm filterReplay 同口径）或已越过补发窗（严格 > 才可清，D-A）。
 //   - 互斥分组由判定顺序构造：全覆盖、无重叠、幂等；纯函数不修改入参数组。
 
 import type { TaskRecord } from "./store.ts";
 import type { TaskStatus } from "./states.ts";
+import { REPLAY_WINDOW_MS } from "./constants.ts";
 
 /** selectTasksForCleanup 的 skipped 分组名：活跃 / 可复活（failed 未用尽）/ 未通知 */
 export type CleanupSkipGroup = "active" | "retryable" | "unnotified";
@@ -42,8 +45,9 @@ export function isTrulyTerminal(task: TaskRecord): boolean {
 
 /**
  * 可清判定：真终态 ∧ 通知守卫通过。
- * 守卫 = notifiedAt > 0（结果摘要/完成通知已送达主会话）∨ (now - updatedAt) > replayWindowMs。
- * 严格 >（D-A）：恰 = replayWindowMs 仍处补发窗内（farm.ts:301 filterReplay 对 ≤24h 补发，
+ * 守卫 = (Number.isFinite(notifiedAt) && notifiedAt > 0)（结果摘要/完成通知已送达主会话；
+ * 非有限数视为未通知，与 filterReplay 同口径）∨ (now - updatedAt) > replayWindowMs。
+ * 严格 >（D-A）：恰 = replayWindowMs 仍处补发窗内（filterReplay 对 ≤24h 补发，
  * 先删会丢通知，违 PRD §4.9）；+1ms 才算越过补发窗。
  * 契约校验（与 filterReplay 同风格）：now 非有限数 / replayWindowMs 非有限数或 ≤0 → TypeError。
  * 非真终态直接 false（守卫不判）。
@@ -62,11 +66,19 @@ export function isCleanableTerminal(
     );
   }
   if (!isTrulyTerminal(task)) return false;
-  return task.notifiedAt > 0 || now - task.updatedAt > replayWindowMs;
+  return (
+    (Number.isFinite(task.notifiedAt) && task.notifiedAt > 0) ||
+    now - task.updatedAt > replayWindowMs
+  );
 }
 
 /**
- * 选择可清任务集 + 跳过分组（spec §二/§五.2）。互斥由判定顺序构造，全覆盖、无重叠：
+ * 选择可清任务集 + 跳过分组（spec §二/§五.2）。互斥由判定顺序构造，全覆盖、无重叠。
+ * 前置契约校验（02 加固）：now 非有限数 / replayWindowMs 非有限数或 ≤0 → TypeError——
+ * 在遍历前即抛。isCleanableTerminal 的校验只对触达守卫分支的任务生效（活跃/可复活任务
+ * 先行 continue），非法入参在任务全活跃时会被静默漏过，故选择器顶部独立校验（风格同
+ * isCleanableTerminal）。缺省补发窗 = REPLAY_WINDOW_MS（票 09 常量共享，与
+ * store.deleteTask 缺省同源；调用方仍可显式传窄/宽窗）。
  *  1) status ∈ {queued, running, timeout} → skipped.active；
  *  2) status === "failed" && attempts < maxAttempts（与 queue.ts:252 同字面）→ skipped.retryable；
  *  3) 真终态且 status ∉ opts.statuses → 不入任何组（白名单外不判定；aborted 保留数由消费方自统计）；
@@ -80,8 +92,17 @@ export function isCleanableTerminal(
 export function selectTasksForCleanup(
   tasks: readonly TaskRecord[],
   now: number,
-  opts: { replayWindowMs: number; statuses?: ReadonlySet<TaskStatus> },
+  opts: { replayWindowMs?: number; statuses?: ReadonlySet<TaskStatus> },
 ): CleanupSelection {
+  const replayWindowMs = opts.replayWindowMs ?? REPLAY_WINDOW_MS; // 缺省 = 共享常量
+  if (!Number.isFinite(now)) {
+    throw new TypeError(`selectTasksForCleanup: now 必须为有限数，收到 ${JSON.stringify(now)}`);
+  }
+  if (!Number.isFinite(replayWindowMs) || replayWindowMs <= 0) {
+    throw new TypeError(
+      `selectTasksForCleanup: replayWindowMs 必须为有限正数，收到 ${JSON.stringify(replayWindowMs)}`,
+    );
+  }
   const statuses =
     opts.statuses ??
     new Set<TaskStatus>(["done", "aborted", "cancelled", "failed"]);
@@ -106,7 +127,7 @@ export function selectTasksForCleanup(
     }
     // 至此必为真终态（done/aborted/cancelled，或 failed 且 attempts 已用尽）
     if (!statuses.has(task.status)) continue; // 白名单外不判定、不入任何组
-    if (isCleanableTerminal(task, now, opts.replayWindowMs)) {
+    if (isCleanableTerminal(task, now, replayWindowMs)) {
       deletable.push(task);
     } else {
       skipped.unnotified.push(task);

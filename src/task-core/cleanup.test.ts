@@ -1,5 +1,5 @@
 // src/task-core/cleanup.test.ts
-// cleanup.ts 单测：真终态判定 / 通知守卫 / 选择分组 / 显示切分（6 用例）。
+// cleanup.ts 单测：真终态判定 / 通知守卫 / 选择分组 / 显示切分（7 用例）。
 // 只断言外部行为（输入→输出/抛错），不窥探内部实现。
 // 运行：cd src/task-core && node --test cleanup.test.ts
 import { test } from "node:test";
@@ -12,10 +12,10 @@ import {
 } from "./cleanup.ts";
 import type { TaskRecord } from "./store.ts";
 import type { TaskStatus } from "./states.ts";
+import { REPLAY_WINDOW_MS } from "./constants.ts";
 
 const MINUTE = 60 * 1000;
-const HOUR = 60 * MINUTE;
-const DAY = 24 * HOUR; // 与 farm.ts REPLAY_WINDOW_MS 同值
+const DAY = REPLAY_WINDOW_MS; // 补发窗 24h——数值单一事实源 = constants.ts（票 09 常量共享）
 const NOW = 1_700_000_000_000; // 真实 epoch ms，now - 10*MINUTE 仍为正（notifiedAt>0 判定有效）
 
 /** 构造最小合法 TaskRecord（未覆盖字段用中性默认，覆盖项以 partial 指定）。 */
@@ -179,7 +179,7 @@ test("U4 spawnFailed 来源：(a) attempts 用尽 failed → 真终态可清；(
 
 test("U5 守卫边界：未通知 + 恰 24h 仍不可清（严格 >，D-A），+1ms 才可清；契约校验非有限/≤0 → TypeError", () => {
   const T = NOW;
-  // 未通知 + updatedAt=T；REPLAY_WINDOW_MS=24h（farm.ts:63 filterReplay 对 ≤24h 仍补发）
+  // 未通知 + updatedAt=T；守卫窗 24h（constants.ts REPLAY_WINDOW_MS——filterReplay 对 ≤24h 仍补发）
   const task = makeTask({
     taskId: "t-edge",
     status: "done",
@@ -202,6 +202,62 @@ test("U5 守卫边界：未通知 + 恰 24h 仍不可清（严格 >，D-A），+
   assert.throws(() => isCleanableTerminal(task, T + DAY, Number.NaN), TypeError);
   assert.throws(() => isCleanableTerminal(task, T + DAY, 0), TypeError);
   assert.throws(() => isCleanableTerminal(task, T + DAY, -1), TypeError);
+});
+
+test("U7 直接断言补强（02 加固）：timeout→skipped.active；aborted/cancelled 真终态；notifiedAt=Infinity 视为未通知；选择器前置契约 TypeError", () => {
+  const now = NOW;
+  // (a) timeout = 静止非终态（自动出路在 pass B：retry/exhausted/迟到修正），直接断言归 active 组、绝不在 deletable
+  const timeout = makeTask({
+    taskId: "t-timeout",
+    status: "timeout",
+    notifiedAt: now - MINUTE,
+    updatedAt: now - MINUTE,
+  });
+  assert.equal(isTrulyTerminal(timeout), false);
+  const selT = selectTasksForCleanup([timeout], now, { replayWindowMs: REPLAY_WINDOW_MS });
+  assert.deepEqual(selT.skipped.active, [timeout]);
+  assert.deepEqual(selT.deletable, []);
+  assert.deepEqual(selT.skipped.retryable, []);
+  assert.deepEqual(selT.skipped.unnotified, []);
+
+  // (b) aborted/cancelled 封闭零出边 = 真终态（直接断言；aborted 唯一出边是人工 resume）
+  const aborted = makeTask({ taskId: "t-ab", status: "aborted", notifiedAt: now - MINUTE });
+  const cancelled = makeTask({ taskId: "t-cx", status: "cancelled", notifiedAt: now - MINUTE });
+  assert.equal(isTrulyTerminal(aborted), true);
+  assert.equal(isTrulyTerminal(cancelled), true);
+
+  // (c) notifiedAt=Infinity（非有限数）→ 视为未通知（与 filterReplay 同口径，02 加固）：
+  //     近时 updatedAt 守卫不过 → unnotified；越过补发窗才可清（越窗逃生与未通知同权）
+  const inf = makeTask({
+    taskId: "t-inf",
+    status: "done",
+    notifiedAt: Infinity,
+    updatedAt: now - 10 * MINUTE,
+  });
+  assert.equal(isCleanableTerminal(inf, now, REPLAY_WINDOW_MS), false);
+  const selInf = selectTasksForCleanup([inf], now, { replayWindowMs: REPLAY_WINDOW_MS });
+  assert.deepEqual(selInf.skipped.unnotified, [inf]);
+  assert.deepEqual(selInf.deletable, []);
+  const infOld = makeTask({
+    taskId: "t-inf-old",
+    status: "done",
+    notifiedAt: Infinity,
+    updatedAt: now - REPLAY_WINDOW_MS - 1,
+  });
+  assert.equal(isCleanableTerminal(infOld, now, REPLAY_WINDOW_MS), true);
+  const selInfOld = selectTasksForCleanup([infOld], now, { replayWindowMs: REPLAY_WINDOW_MS });
+  assert.deepEqual(selInfOld.deletable, [infOld]);
+
+  // (d) selectTasksForCleanup 前置契约：遍历前即抛（防活跃任务占多数时非法入参静默漏过）
+  assert.throws(() => selectTasksForCleanup([], Number.NaN, { replayWindowMs: REPLAY_WINDOW_MS }), TypeError);
+  assert.throws(() => selectTasksForCleanup([], now, { replayWindowMs: Number.NaN }), TypeError);
+  assert.throws(() => selectTasksForCleanup([], now, { replayWindowMs: 0 }), TypeError);
+  assert.throws(() => selectTasksForCleanup([], now, { replayWindowMs: -1 }), TypeError);
+  // 缺省 replayWindowMs = 共享常量（与 store.deleteTask 缺省同源）：空 opts 不抛、正常返回
+  assert.deepEqual(selectTasksForCleanup([], now, {}), {
+    deletable: [],
+    skipped: { active: [], retryable: [], unnotified: [] },
+  });
 });
 
 test("U6 splitTasksForDisplay 截断切分：活跃全显 + 终态 createdAt ASC 取末 N；recentN=0/999；纯性不修改入参", () => {

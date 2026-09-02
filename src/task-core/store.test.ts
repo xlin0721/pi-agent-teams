@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "./store.ts";
 import type { TaskRecord } from "./store.ts";
+import { REPLAY_WINDOW_MS } from "./constants.ts";
 
 /** 每个用例独立的临时根目录，结束后强制清理。 */
 async function withStore(
@@ -621,7 +622,7 @@ test("deleteTask：真终态但守卫不过（notifiedAt=0 且 updatedAt 在 24h
   await withStore(async (store, root) => {
     const NOW = 1_700_000_000_000;
     const HOUR = 3600 * 1000;
-    // done 但从未通知，1h 前完成（仍在缺省 24h 补发窗内，pin farm.ts:63）
+    // done 但从未通知，1h 前完成（仍在缺省 24h 补发窗内，源 = constants.ts REPLAY_WINDOW_MS）
     await store.writeTask(
       fullRecord({ taskId: "quiet", status: "done", notifiedAt: 0, updatedAt: NOW - HOUR }),
     );
@@ -637,5 +638,22 @@ test("deleteTask：真终态但守卫不过（notifiedAt=0 且 updatedAt 在 24h
       { deleted: true },
     );
     await assert.rejects(readFile(join(root, "tasks", "quiet.json"), "utf8"));
+  });
+});
+
+test("deleteTask：缺省守卫窗与共享常量 REPLAY_WINDOW_MS 同源（恰 24h 仍 unnotified / +1ms 删）", async () => {
+  await withStore(async (store) => {
+    const T = 1_700_000_000_000;
+    await store.writeTask(fullRecord({ taskId: "d-eq", status: "done", notifiedAt: 0, updatedAt: T }));
+    await store.writeTask(fullRecord({ taskId: "d-gt", status: "done", notifiedAt: 0, updatedAt: T }));
+    // 恰 = REPLAY_WINDOW_MS：严格 > 不过（若 deleteTask 缺省被改成更小的窗，此处会误删 → 本用例即红）
+    assert.deepEqual(await store.deleteTask("d-eq", { now: T + REPLAY_WINDOW_MS }), {
+      deleted: false,
+      reason: "unnotified",
+    });
+    // +1ms：越窗 → 删（若缺省被改成更大的窗，此处会漏删 → 本用例即红）
+    assert.deepEqual(await store.deleteTask("d-gt", { now: T + REPLAY_WINDOW_MS + 1 }), {
+      deleted: true,
+    });
   });
 });

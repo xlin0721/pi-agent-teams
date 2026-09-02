@@ -54,6 +54,7 @@ import type { TaskStatus } from "./task-core/states.ts";
 import { buildResumeArgs, findSessionId } from "./task-core/resume.ts";
 import type { TaskRecord, TaskStore } from "./task-core/store.ts";
 import { selectTasksForCleanup } from "./task-core/cleanup.ts";
+import { REPLAY_WINDOW_MS } from "./task-core/constants.ts";
 import type { Queue, StepReport } from "./task-core/queue.ts";
 import { formatDurationMs } from "./display/format.ts";
 
@@ -61,8 +62,11 @@ import { formatDurationMs } from "./display/format.ts";
 
 /** 通知聚合窗口：距上次 flush ≥2s 发 1 条 followUp */
 export const FLUSH_WINDOW_MS = 2000;
-/** 补发窗口：updatedAt 距今 ≤24h 的未通知终态任务在 session_start 补发 */
-export const REPLAY_WINDOW_MS = 24 * 3600 * 1000;
+/** 补发窗口数值源已下沉 task-core/constants.ts（票 09 常量提共享：分层合规——task-core
+ *  层不可 import farm 层，数值一律放共享层）。本行再导出 REPLAY_WINDOW_MS 只为兼容既有
+ *  消费方（index.ts / farm.test.ts 自 farm.ts import）零迁移；文件内部（filterReplay /
+ *  sweepTasks）经顶部 import 引用同一绑定。 */
+export { REPLAY_WINDOW_MS };
 /** GC 口径（v2 部署版实测）：requests 1h */
 export const GC_REQUESTS_TTL_MS = 3600 * 1000;
 /** GC 口径：status 信号文件 24h */
@@ -871,10 +875,22 @@ async function gcIfDue(ctx: FarmContext): Promise<void> {
  * tasks/ 兜底 sweep（GC 清单新条目；含 I/O，故在 farm 层而非纯逻辑 cleanup.ts）：
  * 全量快照 scanTasks(null) → 票 02 selectTasksForCleanup（真终态 + 通知守卫，白名单
  * done/cancelled/failed——aborted 默认排除保留人工 resume）→ 叠加 GC_TASKS_TTL_MS
- * 年龄过滤（now - updatedAt 严格 >，与通知守卫 D-A 同口径：恰 = 24h 仍在补发窗/TTL
- * 边内不删）→ 逐条 store.deleteTask 复查式删除（readTask 现读重验谓词 + rm 幂等，
- * 防快照与删除间竞态）。单条失败（deleteTask 抛错或复查跳过）catch 记 failed 计数
- * 不抛、不断链（镜像 sweepInbox 纪律）。
+ * 年龄过滤（严格 >：恰 24h 不删）→ 逐条 store.deleteTask 复查式删除（readTask 现读
+ * 重验谓词 + rm 幂等，防快照与删除间竞态）。
+ *
+ * 票 09 Suggestion 03 处置（守卫+TTL 双过滤评估结论：保留两处，不可删任一）：
+ *  - 两层角色不同：selectTasksForCleanup 守卫 = 通知安全原语（05 farm_cleanup 即时删时
+ *    是唯一保护）；GC_TASKS_TTL_MS 年龄 = GC「兜底」下限——已通知但 age<24h 的新鲜终态
+ *    守卫可过、TTL 不放行，留待主动清理，GC 不抢删（主动清理为常态的产品语义）。
+ *  - 数值现状 GC_TASKS_TTL_MS === REPLAY_WINDOW_MS，净效果 = 纯 24h 年龄过滤：守卫被
+ *    TTL 完全涵摄（只凭 notifiedAt>0 放行的任务仍须过 TTL；越补发窗的任务必已越 TTL）。
+ *    仍保留 selectTasksForCleanup 调用 = 复用共享选择原语（不重复实现真终态/白名单判定）
+ *    + 防未来两常量解耦（TTL 一旦 < 补发窗，守卫恢复独立作用：未通知且 age 介于二者之间
+ *    的任务须被拦）。两处当前语义等价、删任一处即破坏上述任一点 → 不删，注释说明为据。
+ *  - failed 计数语义 = 「应删而未删」（deleteTask 复查跳过 missing/not-terminal/unnotified
+ *    或抛错），非 status=failed 任务数——变量名 failed 保留（删除失败数惯例语义），注释
+ *    澄清即足；farm.test.ts 对 {deleted, failed} 形状断言（deleted:1,failed:1 等）同步确认。
+ * 单条失败 catch 记 failed 不抛、不断链（镜像 sweepInbox 纪律）。
  * 导出（非私有）仅供单测观测 failed 计数；消费方 = gcOnce（位置：sessions 之后）。
  */
 export async function sweepTasks(
@@ -889,7 +905,9 @@ export async function sweepTasks(
   let deleted = 0;
   let failed = 0;
   for (const task of selection.deletable) {
-    if (!(now - task.updatedAt > GC_TASKS_TTL_MS)) continue; // 严格 >：恰 24h 不删
+    // TTL 兜底下限（与守卫的角色分工见函数头 Suggestion 03 处置）：已通知但 age<24h 的
+    // 新鲜终态不放行（留待 05 主动清理）；严格 >：恰 24h 不删
+    if (!(now - task.updatedAt > GC_TASKS_TTL_MS)) continue;
     try {
       const result = await store.deleteTask(task.taskId, { now });
       if (result.deleted) deleted += 1;

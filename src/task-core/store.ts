@@ -24,6 +24,10 @@ import type { TaskStatus } from "./states.ts";
 // cleanup → store 为 import type（type-stripping 下完整擦除）→ 运行时无环。
 import { isTrulyTerminal, isCleanableTerminal } from "./cleanup.ts";
 
+// 共享常量（票 09）：deleteTask 缺省守卫窗 = REPLAY_WINDOW_MS（单一事实源 =
+// task-core/constants.ts——本地副本常量已删除，与 farm 补发窗同源，杜绝数值漂移）。
+import { REPLAY_WINDOW_MS } from "./constants.ts";
+
 /**
  * taskId 安全段校验（writeTask/readTask/readStatusSignal 入口）：防路径逃逸。
  * 空串、单点段（.、..）或含路径分隔符（/ 或 \）→ TypeError；其余字符放行。
@@ -129,11 +133,6 @@ export interface ReadStatusSignalOptions {
    */
   since?: number;
 }
-
-/** 通知守卫缺省补发窗：24h。数值 pin：farm.ts:63 REPLAY_WINDOW_MS——task-core 层
- * 不 import farm 层（分层纪律），以本地副本 + 注释 pin 保持单一事实源；消费方
- * （03 sweep / 05 farm_cleanup）显式传 replayWindowMs 消除数值漂移风险。 */
-const DEFAULT_REPLAY_WINDOW_MS = 24 * 3600 * 1000;
 
 /** deleteTask 跳过原因分组（供 03 sweep / 05 farm_cleanup 的 skipped 分组统计复用）。 */
 export type DeleteSkipReason = "missing" | "not-terminal" | "unnotified";
@@ -349,7 +348,7 @@ export class TaskStore {
   /**
    * 复查式删除（票 01）：readTask 现读 → 重验谓词 → rm force 幂等。
    *   ① assertSafeTaskId 先于一切 I/O（与 readTask/writeTask 同门抛 TypeError）；
-   *   ② now / replayWindowMs 取 opts 或缺省（Date.now() / 24h pin farm.ts:63）；
+   *   ② now / replayWindowMs 取 opts 或缺省（Date.now() / REPLAY_WINDOW_MS，constants.ts 单源）；
    *   ③ readTask 现读：缺文件 / 坏 JSON / 根非对象 → null → {deleted:false,reason:"missing"}
    *     不抛（坏文件「无法验谓词即不删」取安全方向，坏文件清理归 03 sweep 侧）；
    *   ④ !isTrulyTerminal → {deleted:false,reason:"not-terminal"}（复查时已复活/活跃/可复活）；
@@ -362,7 +361,7 @@ export class TaskStore {
   async deleteTask(taskId: string, opts?: DeleteTaskOptions): Promise<DeleteTaskResult> {
     assertSafeTaskId(taskId);
     const now = opts?.now ?? Date.now();
-    const replayWindowMs = opts?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
+    const replayWindowMs = opts?.replayWindowMs ?? REPLAY_WINDOW_MS;
     const record = await this.readTask(taskId);
     if (record === null) return { deleted: false, reason: "missing" };
     if (!isTrulyTerminal(record)) return { deleted: false, reason: "not-terminal" };
