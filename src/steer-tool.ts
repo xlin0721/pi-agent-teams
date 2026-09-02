@@ -408,7 +408,7 @@ export function resumeRejectText(
     case "not-aborted":
       return `❌ 任务 ${taskId} 当前状态为 ${status ?? "非 aborted"}，仅 aborted 任务支持 resume，failed/cancelled 请重新派发。`;
     case "session-gone":
-      return `❌ 任务 ${taskId} 的会话已被回收，无法恢复（会话保留 7 天，超期后 GC）。`;
+      return `❌ 任务 ${taskId} 的会话已被回收，无法恢复（会话保留 3 天，超期后 GC）。`;
   }
 }
 

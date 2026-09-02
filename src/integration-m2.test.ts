@@ -754,7 +754,7 @@ test("场景8：shutdown 全 kill——killSync 记录 + queued/running → canc
   assert.equal(q?.status, "cancelled");
   assert.equal(r?.updatedAt, 300_000);
 
-  // kill 不删 session 文件（回收归 GC 7d 口径）
+  // kill 不删 session 文件（回收归 GC 3d 口径）
   assert.equal(await readFile(sessionFile, "utf8"), '{"line":1}\n');
 
   // stop 幂等：再次 stop 不重复 kill、状态不变

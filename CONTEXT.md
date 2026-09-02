@@ -56,6 +56,10 @@ _Avoid_: 子农场、二级农场
 七态：queued → running → done / aborted / failed / timeout / cancelled（timeout/failed 可经 retry 回 queued，aborted 可经 resume 回 queued；完整迁移表见 PRD §13.3）。steer 投递态（pending→delivered→read）在 inbox 消息文件上推进，不进任务状态枚举。状态面板与队列按此汇报。
 _Avoid_: pending、in-progress（用 queued/running）
 
+**Task cleanup（任务清理 / 一次性语义）**:
+任务执行完（真终态 + 结果通知已确认）即可随时清理——`farm_cleanup` 第 6 工具（FR8 5→6，默认 dry-run、`--confirm` 才删、逐条复查式删除）；面板只显示活跃任务（active-only），终态完成即不在面板出现。**aborted 是唯一例外**（可 resume，默认排除可清集合，须显式点名才清）。自动 GC 兜底 24h（main 宕机期间任务保留超 24h 属已知有界窗口，重启后 GC 追赶清理）；sessions/log 保留 **3d**（aborted resume 窗口）。真终态 = done | aborted | cancelled ∪（failed && attempts 用尽）；可复活 failed（attempts 未用尽）与未通知任务不可清。
+_Avoid_: 会话保留 7 天（旧误读——7d 从未作用于任务，task-cleanup 后 sessions 亦为 3d）
+
 **Steer（指挥）**:
 对运行中角色 agent 的回合边界软干预：当前这轮工具调用全部执行完后投递。不是硬中断（官方无 kill API）。由 main 发给角色 agent；角色 agent 对 worker 的纠偏走消息通道（不在 steer 范围内）。
 _Avoid_: 打断、中断、kill
@@ -77,7 +81,7 @@ PI_AGENT_TEAMS_DEPTH 透传，depth = ownDepth+1（main=0 缺省）；depth≥2 
 _Avoid_: 层级派发（旧称）、递归派发
 
 **farm_resume 工具（resume tool）**:
-main-only 的 `farm_resume <taskId>`（owner-scoped）：仅 aborted 可 resume（failed/cancelled 拒绝），复用 `aborted × resume → queued` 迁移边，≤7d 窗口；depth-2 跨 owner resume 留 M4+。
+main-only 的 `farm_resume <taskId>`（owner-scoped）：仅 aborted 可 resume（failed/cancelled 拒绝），复用 `aborted × resume → queued` 迁移边，≤3d 窗口（task-cleanup 2026-09-01：sessions 7d→3d）；depth-2 跨 owner resume 留 M4+。
 _Avoid_: 重启、重跑（Resume 是概念，farm_resume 是工具）
 
 **setWidget 面板（F1 台账）**:

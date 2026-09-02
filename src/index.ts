@@ -1,6 +1,6 @@
 // src/index.ts
 // pi-agent-teams v3 扩展入口（运行时边界，06 装配票）：注册 spawn_visible_agent /
-// farm_status 工具、capability probe 启动执行、装配 display（04）+ task-core（03）+
+// farm_status / farm_cleanup 工具、capability probe 启动执行、装配 display（04）+ task-core（03）+
 // farm（05）三件。
 //
 // 边界纪律：本文件是唯一可 import pi SDK 的模块（v2 部署版同款 import 形态）；
@@ -16,7 +16,7 @@
 //   Executor.steer：no-op 占位（steer 通道 M3）；Executor.kill：display.kill；
 // - wireFarm：400ms ticker + 3s pane 探测 + 聚合 followUp 通知（farm.done,
 //   deliverAs:"followUp", triggerTurn:true）+ session_shutdown 全 kill（killSync）+
-//   GC 7d 口径；
+//   GC 3d 口径；
 // - wireFarm 的 display 入参过适配层（修复轮：三审计一致 HIGH「装配契约断接」）：
 //   04 的 listPanes 返回 PaneInfo 对象数组，farm 契约收 string[]——PaneInfo 经
 //   display/adapt.ts（本文件 import）转 pane_id 字符串（缺失/空项剔除），防探测
@@ -55,11 +55,17 @@ import { computePlacementFromSnapshot } from "./display/grid.ts";
 import type { GridPlacement } from "./display/grid.ts";
 import { adaptListPanes } from "./display/adapt.ts";
 import { TaskStore } from "./task-core/store.ts";
-import type { TaskRecord } from "./task-core/store.ts";
+import type { DeleteSkipReason, TaskRecord } from "./task-core/store.ts";
 import { Queue, parseUsageSidecar } from "./task-core/queue.ts";
 import type { Executor, UsageSidecar } from "./task-core/queue.ts";
 import { findSessionId } from "./task-core/resume.ts";
-import { wireFarm } from "./farm.ts";
+import {
+  selectTasksForCleanup,
+  splitTasksForDisplay,
+  type CleanupSelection,
+} from "./task-core/cleanup.ts";
+import type { TaskStatus } from "./task-core/states.ts";
+import { REPLAY_WINDOW_MS, wireFarm } from "./farm.ts";
 import { Inbox } from "./task-core/steer.ts";
 import { createWaiter } from "./sync-wait.ts";
 import type { Waiter } from "./sync-wait.ts";
@@ -79,19 +85,21 @@ import {
   synthesize,
 } from "./comm/meeting.ts";
 import { buildFeed } from "./comm/feed.ts";
-import { DEFAULT_PRICING_TABLE, parsePricingTable } from "./pricing.ts";
+import { DEFAULT_PRICING_TABLE, costAmount, formatCost, parsePricingTable } from "./pricing.ts";
 import type { PricingTable } from "./pricing.ts";
 import { PRESENCE_HEARTBEAT_MS, readPresences, writePresence } from "./comm/presence.ts";
 import {
+  FARM_STATUS_LABELS,
   FARM_STATUS_VALUES,
   degradeRejectText,
+  durationText,
   isL2Env,
   isPaneMode,
   listAgentRoles,
   ownDepth,
+  PANEL_MAX_ROWS,
   panelChanged,
   queuedPosition,
-  renderFarmTable,
   renderTaskDetail,
   resolveSpawnDepthForm,
   runProbe,
@@ -610,7 +618,241 @@ async function executeFarmStatus(
     typeof params.status === "string" && params.status !== ""
       ? tasks.filter((task) => task.status === params.status)
       : tasks;
-  return { content: [{ type: "text", text: renderFarmTable(filtered, now) }] };
+  return { content: [{ type: "text", text: renderFarmToolTable(filtered, now) }] };
+}
+
+/** 本地 padCell（probe.ts padCell 为私有；列宽与 renderFarmTable 逐字对齐 8/12/8/8）。 */
+function padCell(text: string, width: number): string {
+  return text.length >= width ? text.slice(0, width) : text.padEnd(width);
+}
+
+function spawnRole(task: TaskRecord): string {
+  const role = task.payload?.spawn?.role;
+  return typeof role === "string" ? role : "";
+}
+
+/** 表格行（8/12/8/8 + durationText 尾列，与 renderFarmTable 行逐字同宽）。 */
+function farmToolRow(task: TaskRecord, now: number): string {
+  const attempts = `${task.attempts}/${task.maxAttempts}`;
+  return [
+    padCell(task.taskId.slice(0, 8), 8),
+    padCell(spawnRole(task) || "-", 12),
+    padCell(FARM_STATUS_LABELS[task.status] ?? String(task.status), 8),
+    padCell(attempts, 8),
+    durationText(task, now),
+  ].join(" ");
+}
+
+/**
+ * farm_status 工具侧渲染（票 05 双截断统一，弃用 probe.renderFarmTable）：
+ * splitTasksForDisplay(filtered, PANEL_RECENT_N) →「活跃」+「最近终态」两节——活跃硬顶
+ * PANEL_MAX_ROWS 折叠（「另有 K 条排队」行），终态 50 上限（recent = createdAt 升序末
+ * N 条）。--status done 等显式过滤时终态恢复显示。空列表保留计数行（footer）。
+ */
+function renderFarmToolTable(tasks: readonly TaskRecord[], now: number): string {
+  const { active, recent } = splitTasksForDisplay(tasks, PANEL_RECENT_N);
+  const activeSorted = sortTasksForDisplay(active);
+  const header = "taskId   role         status   attempts 耗时";
+  const lines: string[] = [];
+  if (activeSorted.length > 0) {
+    lines.push("活跃");
+    lines.push(header);
+    for (const task of activeSorted.slice(0, PANEL_MAX_ROWS)) lines.push(farmToolRow(task, now));
+    const folded = activeSorted.length - PANEL_MAX_ROWS;
+    if (folded > 0) lines.push(`另有 ${folded} 条排队`);
+  }
+  if (recent.length > 0) {
+    lines.push(`最近终态（≤${PANEL_RECENT_N}）`);
+    lines.push(header);
+    for (const task of recent) lines.push(farmToolRow(task, now));
+  }
+  const queued = activeSorted.filter((task) => task.status === "queued").length;
+  lines.push(`活跃 ${activeSorted.length} · 排队 ${queued} · 最近终态 ${recent.length} · 任务执行完即可清理`);
+  return lines.join("\n");
+}
+
+// ── farm_cleanup 工具（票 05：终态清理 + 教学 description + 费用影响） ───────────
+
+/** farm_cleanup 可清状态白名单（真终态四态；aborted 默认排除，显式点名才并入） */
+const CLEANUP_STATUSES = ["done", "cancelled", "failed", "aborted"] as const;
+/** status 缺省集 = {done, cancelled, failed}（aborted 唯一例外：可 resume，默认保留） */
+const DEFAULT_CLEANUP_STATUSES: ReadonlySet<TaskStatus> = new Set(["done", "cancelled", "failed"]);
+
+interface CleanupDeps {
+  store: TaskStore;
+  pricing: PricingTable;
+  placeholder: boolean;
+}
+
+/**
+ * status 参数解析（逗号分隔真终态子集）：空/缺省 → 缺省集；任一 token 非真终态
+ * （含 queued/running/timeout 与未知值）→ 拒绝文案（❌）。返回 {statuses} | {error}。
+ */
+function parseCleanupStatuses(
+  status: string | undefined,
+): { statuses: ReadonlySet<TaskStatus> } | { error: string } {
+  if (status === undefined || status === null || status === "") {
+    return { statuses: DEFAULT_CLEANUP_STATUSES };
+  }
+  const tokens = String(status)
+    .split(",")
+    .map((token) => token.trim())
+    .filter((token) => token !== "");
+  const statuses = new Set<TaskStatus>();
+  for (const token of tokens) {
+    if (!(CLEANUP_STATUSES as readonly string[]).includes(token)) {
+      return {
+        error:
+          `❌ 非法 status "${token}"：只接受真终态 ${CLEANUP_STATUSES.join("/")}（逗号分隔）。` +
+          `queued/running/timeout 非终态不可清理（timeout 可能自动复活重试）。`,
+      };
+    }
+    statuses.add(token as TaskStatus);
+  }
+  return { statuses };
+}
+
+/** 单任务成本（仅计 result.cost；无有效字段 / 未知模型 → null）。 */
+function taskCostAmount(task: TaskRecord, pricing: PricingTable): number | null {
+  const cost = task.result?.cost;
+  const model = typeof cost?.model === "string" ? cost.model : "";
+  const inputTokens = typeof cost?.inputTokens === "number" ? cost.inputTokens : 0;
+  const outputTokens = typeof cost?.outputTokens === "number" ? cost.outputTokens : 0;
+  if (model === "" && inputTokens === 0 && outputTokens === 0) return null;
+  return costAmount(pricing, model, inputTokens, outputTokens);
+}
+
+/** owner 分布（owner 空串 → "(unknown)"，确定性排序渲染）。 */
+function countByOwner(tasks: readonly TaskRecord[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const task of tasks) {
+    const owner = task.owner === "" ? "(unknown)" : task.owner;
+    map.set(owner, (map.get(owner) ?? 0) + 1);
+  }
+  return map;
+}
+
+function ownerSection(ownerCount: ReadonlyMap<string, number>): string {
+  const parts = [...ownerCount.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return parts.length === 0
+    ? "owner 分布: 无"
+    : `owner 分布: ${parts.map(([owner, n]) => `${owner}: ${n}`).join("，")}`;
+}
+
+/** 费用影响行（getPricingTable 同源：result.cost → costAmount；aborted 侧成本不计入）。 */
+function costSection(cost: number, pricing: PricingTable, placeholder: boolean): string {
+  const line = `费用影响: 合计 ${formatCost(cost, pricing.currency)}（仅计 result.cost，aborted 侧成本不计入）`;
+  return placeholder
+    ? `${line}\n⚠️ 成本为占位价：请编辑 ~/.pi-agent-teams/pricing.json 校准（缺文件/坏 JSON 时回退默认价）`
+    : line;
+}
+
+/** skipped 分组（活跃/可复活/未通知；教学 ②：未通知是正常非 bug，稍后自动补发）。 */
+function skipSection(skipped: CleanupSelection["skipped"]): string {
+  return [
+    "skipped 分组:",
+    `  活跃 ${skipped.active.length}（queued/running/timeout 非终态不可清理）`,
+    `  可复活 ${skipped.retryable.length}（failed 未用尽 attempts，队列可能自动重试）`,
+    `  未通知 ${skipped.unnotified.length}（终态但通知未送达——未通知是正常非 bug，稍后自动补发）`,
+  ].join("\n");
+}
+
+/** 空态行（deletable 为空时展示；aborted 默认保留供人工 resume）。 */
+function emptySection(deletable: number): string | null {
+  return deletable === 0 ? "无可清理（真终态且已通知才可清；aborted 默认保留）" : null;
+}
+
+/** confirm 路径 deleteTask 复查跳过行（dry-run 无；无跳过 → null）。 */
+function recheckLine(recheck: Record<DeleteSkipReason, number>): string | null {
+  const lines: string[] = [];
+  if (recheck["not-terminal"] > 0) {
+    lines.push(`已复活/非终态 ${recheck["not-terminal"]}（复查时状态已迁移，跳过）`);
+  }
+  if (recheck.missing > 0) {
+    lines.push(`已消失 ${recheck.missing}（复查时任务不存在，跳过）`);
+  }
+  if (recheck.unnotified > 0) {
+    lines.push(`未通知 ${recheck.unnotified}（复查时仍未通知，跳过——未通知是正常非 bug）`);
+  }
+  return lines.length > 0 ? `复查跳过: ${lines.join("；")}` : null;
+}
+
+/**
+ * farm_cleanup 执行（主流程）：scanTasks(null) → selectTasksForCleanup（REPLAY_WINDOW_MS
+ * 单源自 farm.ts；statuses 缺省 {done,cancelled,failed}，aborted 显式点名才并入；无时间
+ * 下界）→ confirm=false 纯报告（dry-run 未删）｜true 逐条 store.deleteTask(taskId) 复查式
+ * 删除（已复活/未通知→skipped；rm 异常→failed 计数）→ MECE 分节文本
+ * （删除数+owner 分布 → 费用影响 → failed 计数 → skipped 分组 → 空态）。
+ */
+async function executeCleanup(
+  params: { status?: string; confirm?: boolean },
+  deps: CleanupDeps,
+): Promise<unknown> {
+  const now = Date.now();
+  const parsed = parseCleanupStatuses(params.status);
+  if ("error" in parsed) {
+    return { content: [{ type: "text", text: parsed.error }] };
+  }
+  const statuses = parsed.statuses;
+  const all = await deps.store.scanTasks(null);
+  const selection = selectTasksForCleanup(all, now, {
+    replayWindowMs: REPLAY_WINDOW_MS,
+    statuses,
+  });
+  const statusLabel = [...statuses].sort().join("/");
+
+  if (params.confirm !== true) {
+    // ⏳ 报告（dry-run）：不删除任何任务；展示可清理集 + 费用影响 + skipped 分组
+    const total = selection.deletable.length;
+    const cost = selection.deletable.reduce(
+      (sum, task) => sum + (taskCostAmount(task, deps.pricing) ?? 0),
+      0,
+    );
+    const sections = [
+      `⏳ farm_cleanup 报告（dry-run，未删除任何任务）——确认后带 --confirm 重跑。`,
+      `可清理 ${total} 个（status 白名单: ${statusLabel}）`,
+      ownerSection(countByOwner(selection.deletable)),
+      costSection(cost, deps.pricing, deps.placeholder),
+      skipSection(selection.skipped),
+      emptySection(total),
+    ].filter((line): line is string => line !== null && line !== "");
+    return { content: [{ type: "text", text: sections.join("\n") }] };
+  }
+
+  // ✅ 确认执行：逐条复查式删除（deleteTask 内部 readTask 现读重验谓词）
+  let deleted = 0;
+  let failed = 0;
+  let cost = 0;
+  const ownerCount = new Map<string, number>();
+  const recheck: Record<DeleteSkipReason, number> = { missing: 0, "not-terminal": 0, unnotified: 0 };
+  const failedSamples: string[] = [];
+  for (const task of selection.deletable) {
+    try {
+      const result = await deps.store.deleteTask(task.taskId);
+      if (result.deleted) {
+        deleted += 1;
+        cost += taskCostAmount(task, deps.pricing) ?? 0;
+        ownerCount.set(task.owner, (ownerCount.get(task.owner) ?? 0) + 1);
+      } else {
+        recheck[result.reason] += 1;
+      }
+    } catch {
+      failed += 1; // rm 异常等：单条失败跳过不挡其余
+      if (failedSamples.length < 3) failedSamples.push(task.taskId.slice(0, 8));
+    }
+  }
+  const sections = [
+    `✅ 已清理 ${deleted} 个任务（status 白名单: ${statusLabel}）`,
+    ownerSection(ownerCount),
+    costSection(cost, deps.pricing, deps.placeholder),
+    failed > 0
+      ? `⚠️ ${failed} 个删除失败（已跳过）：${failedSamples.join(", ")}${failedSamples.length < failed ? " …" : ""}`
+      : null,
+    recheckLine(recheck),
+    skipSection(selection.skipped),
+    emptySection(selection.deletable.length),
+  ].filter((line): line is string => line !== null && line !== "");
+  return { content: [{ type: "text", text: sections.join("\n") }] };
 }
 
 // ── pane 侧武装（depth-1 角色 agent mini-farm / depth-2 零工具） ─────────────
@@ -950,18 +1192,31 @@ function registerResumeTool(pi: ExtensionAPI, store: TaskStore): void {
     name: "farm_resume",
     label: "Resume Task",
     description:
-      "Resume an ABORTED task from its last conversation (≤7d session GC window). " +
+      "Resume an ABORTED task from its last conversation (≤3d session GC window). " +
       "Only aborted tasks are resumable (failed/cancelled must be re-dispatched). " +
       "Returns 「已恢复任务 <taskId8>」; the task re-enters the queue at its position.",
     promptGuidelines: [
       "Only aborted tasks support resume; failed/cancelled are rejected with guidance to re-dispatch.",
-      "If the session was GC'd (>7d), resume reports 「会话已被回收，无法恢复」.",
+      "If the session was GC'd (>3d), resume reports 「会话已被回收，无法恢复」.",
     ],
     parameters: Type.Object({
       taskId: Type.String({ description: "taskId returned by spawn_visible_agent (must be aborted)" }),
     }),
     async execute(_toolCallId: unknown, params: unknown) {
-      return executeResume(params as ResumeToolParams, {
+      const resumeParams = params as ResumeToolParams;
+      const record = await store.readTask(resumeParams.taskId);
+      if (record === null) {
+        // 🟡48 R6：已删任务友好兜底（farm_cleanup 清理后不可恢复；aborted 默认保留可 resume）
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ 任务 ${resumeParams.taskId} 不存在——可能已被 farm_cleanup 清理（终态任务清理后不可恢复；aborted 默认保留，可 resume）。请用 farm_status 查看现存任务，或重新派发。`,
+            },
+          ],
+        };
+      }
+      return executeResume(resumeParams, {
         readTask: (id) => store.readTask(id),
         scanTasks: (owner) => store.scanTasks(owner),
         writeTask: (r) => store.writeTask(r),
@@ -1071,9 +1326,10 @@ async function refreshPanel(store: TaskStore, setWidget: (lines: string[]) => vo
     const now = Date.now();
     const tasks = await store.scanTasks(null);          // 全量（计数行需总数，台账口径）
     const presences = await readPresences(FARM_ROOT);
-    // sidecar / inbox I/O 只读 recent N（BE#5：不在 scanTasks(null) 之外再叠加线性读盘）
-    const sorted = sortTasksForDisplay(tasks);
-    const shown = PANEL_RECENT_N > 0 && sorted.length > PANEL_RECENT_N ? sorted.slice(-PANEL_RECENT_N) : sorted;
+    // sidecar / inbox I/O 只读 shown 集（票 05 双截断统一：活跃硬顶 100 + 最近终态 50，
+    // 读盘上界 ≤150，BE#5 保持——不在 scanTasks(null) 之外再叠加线性读盘）
+    const { active, recent } = splitTasksForDisplay(tasks, PANEL_RECENT_N);
+    const shown = [...active.slice(0, PANEL_MAX_ROWS), ...recent];
     const usageMap = await readUsageMap(shown);
     const inboxSnapshot = await readInboxForTasks(shown);
     const lines = buildFeed(tasks, presences, inboxSnapshot, usageMap, { now, recentN: PANEL_RECENT_N, pricing: getPricingTable() });
@@ -1157,13 +1413,15 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
     label: "Farm Status",
     description:
       "Show the farm task list or a single task's detail. No args = 5-column table " +
-      "(taskId 前 8 位/role/status/attempts/耗时; sessions are kept 7 days). " +
+      "(taskId 前 8 位/role/status/attempts/耗时; sessions are kept 3 days). " +
       "Pass status to filter by one of queued/running/timeout/done/aborted/failed/cancelled. " +
+      "终态任务可随时用 farm_cleanup 清理（已通知即清，aborted 默认保留）。 " +
       "Pass taskId (from spawn_visible_agent) for detail: full taskId/role/status/attempts/" +
       "nextAttemptAt/恢复命令/耗时.",
     promptGuidelines: [
       "Use farm_status to check farm task progress, queue position, or a task's resume command.",
       "Use farm_status <taskId> for detail when a spawn_visible_agent taskId needs inspection.",
+      "Finished tasks can be cleaned up anytime with farm_cleanup (results already notified); aborted stays for resume.",
     ],
     parameters: Type.Object({
       status: Type.Optional(StringEnum(FARM_STATUS_VALUES as unknown as readonly [string, ...string[]])),
@@ -1171,6 +1429,45 @@ export default function piAgentTeamsExtension(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId: unknown, params: unknown) {
       return executeFarmStatus(params as { status?: string; taskId?: string }, { store });
+    },
+  });
+
+  // farm_cleanup（票 05）：main + depth-1 注册（第 6 工具；共享路径紧接 farm_status 后，
+  // depth-2 零工具早退不注册）。教学：任务一次性即清 + 永远先报告再 confirm；
+  // aborted 唯一例外（可 resume），默认不碰、显式 --status aborted 点名才清。
+  pi.registerTool({
+    name: "farm_cleanup",
+    label: "Farm Cleanup",
+    description:
+      "Clean up finished farm tasks (done/cancelled/failed by default; aborted excluded). " +
+      "任务一次性——执行完毕（结果通知已收到）即可随时清理，不必等用户要求；" +
+      "aborted 是唯一例外（可 farm_resume 恢复），默认不碰、显式 --status aborted 点名才清。 " +
+      "永远先跑报告（默认 dry-run，不删除），读 skipped 分组（未通知是正常非 bug）再 --confirm 执行。 " +
+      "无时间下界（不做年龄过滤）；真终态且已通知才可清。",
+    promptGuidelines: [
+      "批量 spawn 完成后顺手清理（任务执行完即可清理，不必等用户要求）。",
+      "永远先跑报告（默认 dry-run），读 skipped 分组（未通知是正常非 bug）再 --confirm。",
+      "清理≠取消任务：queued/running/timeout 非终态一律拒绝；timeout 可能自动复活重试。",
+      "费用减少透明汇报：--confirm 前后对照合计（列表 X→Y / 合计 -$Z）。",
+      "清理后可用 farm_status 闭环验证（终态任务应从列表消失）。",
+      "per-workspace 边界：depth-1 角色 agent 可清理 main 层任务（共享农场根）。",
+      "与自动 GC 双轨：主动清理更快，GC 24h 兜底（tasks 真终态 24h 回收）。",
+    ],
+    parameters: Type.Object({
+      status: Type.Optional(
+        Type.String({
+          description:
+            "逗号分隔的真终态子集（done/cancelled/failed/aborted；缺省 = done,cancelled,failed，aborted 默认排除、显式点名才清）",
+        }),
+      ),
+      confirm: Type.Optional(Type.Boolean({ description: "true = 执行删除（默认 false = dry-run 报告）" })),
+    }),
+    async execute(_toolCallId: unknown, params: unknown) {
+      return executeCleanup(params as { status?: string; confirm?: boolean }, {
+        store,
+        pricing: getPricingTable(),
+        placeholder: pricingPlaceholder,
+      });
     },
   });
 

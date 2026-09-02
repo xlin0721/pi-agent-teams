@@ -1,6 +1,7 @@
 // src/comm/feed.test.ts
-// buildFeed 纯渲染用例（票 01 plan §5.3 清单全覆盖）。
-// 只断言输出行文本（表头/5 列宽对齐/usage/投递态/截断/recent N/存活计数），零 I/O。
+// buildFeed 纯渲染用例（票 01 plan §5.3 清单全覆盖；票 04：active-only shown 源 + 行
+// 硬顶 100 + 折叠、recentN 废弃 no-op、presence 不再入 footer、合计口径静态注记）。
+// 只断言输出行文本（表头/5 列宽对齐/usage/投递态/截断/active-only/折叠/footer），零 I/O。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildFeed } from "./feed.ts";
@@ -78,11 +79,11 @@ function inboxMsg(over: Partial<InboxMessage> = {}): InboxMessage {
   };
 }
 
-test("空 tasks：只有表头 + 计数行（存活 0）", () => {
+test("空 tasks：只有表头 + footer（活跃 0 · 排队 0 + 即清 + 合计口径注记）", () => {
   const feed = buildFeed([], [], [], new Map(), { now: NOW });
   assert.deepEqual(feed, [
     "taskId   role         status   attempts 耗时 usage/费用 投递",
-    "共 0 个任务 · 存活 0 · 会话保留 7 天",
+    "活跃 0 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）",
   ]);
 });
 
@@ -152,41 +153,41 @@ test("窄宽截断（FE#4）：长 usage/投递态右向截断加 …，前 5 �
   assert.ok(row.startsWith(five + " "), "前 5 列不折行");
 });
 
-test("recent N（BE#5）：>N 条任务只渲染最近 N 行，计数行仍显总数", () => {
+test("recentN 废弃 no-op（票 04）：传 recentN 不截断，全部活跃行渲染 + 无「显示最近」段", () => {
   const tasks = [1, 2, 3, 4, 5].map((i) => makeTask({ taskId: `t${i}`, createdAt: i }));
   const feed = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN: 2 });
 
-  assert.equal(feed.length, 4); // 表头 + 2 行 + 计数
+  assert.equal(feed.length, 7); // 表头 + 5 活跃行 + footer
   const order = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
-  assert.deepEqual(order, ["t4", "t5"]); // 最新创建的 2 条
-  assert.equal(feed[3], "共 5 个任务 · 存活 0 · 会话保留 7 天（显示最近 2/5）");
+  assert.deepEqual(order, ["t1", "t2", "t3", "t4", "t5"]); // 全部活跃渲染（缺省 status=running）
+  assert.equal(feed[6], "活跃 5 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });
 
-test("缺省 recentN=50（BE#5）：>50 条任务不传 recentN 只渲染尾 50 行 + 计数行", () => {
-  const tasks = Array.from({ length: 53 }, (_, i) =>
-    makeTask({ taskId: `t${i + 1}`, createdAt: i + 1 }),
+test("硬顶 PANEL_MAX_ROWS=100（票 04）：120 活跃缺省折叠为 100 行 +「另有 20 条排队」+ footer", () => {
+  const tasks = Array.from({ length: 120 }, (_, i) =>
+    makeTask({ taskId: `t${String(i + 1).padStart(3, "0")}`, createdAt: i + 1 }),
   );
   const feed = buildFeed(tasks, [], [], new Map(), { now: NOW });
 
-  assert.equal(feed.length, 52); // 表头 + 50 行 + 计数
-  const order = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
-  assert.equal(order.length, 50);
-  assert.deepEqual(order, Array.from({ length: 50 }, (_, i) => `t${i + 4}`));
-  assert.equal(feed[51], "共 53 个任务 · 存活 0 · 会话保留 7 天（显示最近 50/53）");
+  assert.equal(feed.length, 103); // 表头 + 100 行 + 折叠行 + footer
+  const order = feed.slice(1, 101).map((line) => line.slice(0, 8).trim());
+  assert.equal(order.length, 100);
+  assert.equal(feed[101], "另有 20 条排队");
+  assert.equal(feed[102], "活跃 120 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });
 
-test("recentN <= 0：不截断，渲染全部", () => {
+test("recentN<=0（票 04 废弃 no-op 同款）：recentN 忽略，全部活跃渲染", () => {
   const tasks = [1, 2, 3].map((i) => makeTask({ taskId: `t${i}`, createdAt: i }));
   const feed = buildFeed(tasks, [], [], new Map(), { now: NOW, recentN: 0 });
-  assert.equal(feed.length, 5); // 表头 + 3 行 + 计数
-  assert.ok(feed[4].startsWith("共 3 个任务"));
+  assert.equal(feed.length, 5); // 表头 + 3 行 + footer
+  assert.equal(feed[4], "活跃 3 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });
 
-test("存活计数：presence 含过期项 → 存活 M 只计 alive", () => {
+test("presence 不再入 footer（票 04 签名兼容）：存活计数不出现，输出不受 presence 影响", () => {
   const alive = { taskId: "t1", paneId: "p1", role: "r", depth: 1, pid: 1, heartbeatAt: NOW };
   const expired = { taskId: "t2", paneId: "p2", role: "r", depth: 1, pid: 2, heartbeatAt: NOW - 20_000 };
   const feed = buildFeed([], [alive, expired], [], new Map(), { now: NOW });
-  assert.equal(feed[1], "共 0 个任务 · 存活 1 · 会话保留 7 天");
+  assert.equal(feed[1], "活跃 0 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });
 
 // ── 票 05：成本列（定价经注入 PricingTable 行为断言） ─────────────────────────
@@ -228,8 +229,8 @@ test("成本列：未知模型 → ↑N ↓N —", () => {
   assert.ok(feed[1].includes("↑100 ↓200 —"), feed[1]);
 });
 
-test("costSourceFor：sidecar 优先于 result.cost", () => {
-  const task = withCost(makeTask({ taskId: "t1", status: "done", createdAt: 1 }), {
+test("costSourceFor：sidecar 优先于 result.cost（active-only 下用 running 承载 same 语义）", () => {
+  const task = withCost(makeTask({ taskId: "t1", createdAt: 1 }), {
     model: "model-b",
     inputTokens: 1_000_000,
     outputTokens: 0,
@@ -240,8 +241,8 @@ test("costSourceFor：sidecar 优先于 result.cost", () => {
   assert.ok(!feed[1].includes("$10.0000"), feed[1]);
 });
 
-test("costSourceFor：无 sidecar → result.cost 兜底", () => {
-  const task = withCost(makeTask({ taskId: "t1", status: "done", createdAt: 1 }), {
+test("costSourceFor：无 sidecar → result.cost 兜底（active-only 下用 running 承载 same 语义）", () => {
+  const task = withCost(makeTask({ taskId: "t1", createdAt: 1 }), {
     model: "model-a",
     inputTokens: 1_000_000,
     outputTokens: 0,
@@ -261,12 +262,12 @@ test("表头含 usage/费用", () => {
   assert.equal(feed[0], renderFarmTable([], NOW).split("\n")[0] + " usage/费用 投递");
 });
 
-test("合计行：done 用 result.cost、aborted 用 sidecar、未知模型与无数据排除", () => {
+test("footer 恒含合计口径注记（票 04 D3-A）：静态文案不随任务费用增减；金额求和已删除", () => {
   const done = withCost(makeTask({ taskId: "done", status: "done", createdAt: 1 }), {
     model: "model-a",
     inputTokens: 1_000_000,
     outputTokens: 0,
-  }); // $1.0000
+  }); // $1.0000（终态：不进面板，仅作历史上下文）
   const aborted = makeTask({ taskId: "aborted", status: "aborted", createdAt: 2 });
   const abortedUsage: UsageSidecar = { model: "model-b", inputTokens: 1_000_000, outputTokens: 0, updatedAt: NOW }; // $10.0000
   const unknown = withCost(makeTask({ taskId: "unknown", status: "done", createdAt: 3 }), {
@@ -279,11 +280,59 @@ test("合计行：done 用 result.cost、aborted 用 sidecar、未知模型与�
     now: NOW,
     pricing: TEST_PRICING,
   });
-  assert.ok(feed[5].includes("合计 $11.0000"), feed[5]);
+  // active-only：仅 nodata（running）渲染一行；终态四行不进面板
+  assert.equal(feed.length, 3); // 表头 + 1 活跃行 + footer
+  assert.equal(feed[2], "活跃 1 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+  assert.ok(!feed[2].includes("合计 $"), feed[2]);
+  assert.ok(!feed[1].includes("$"), feed[1]); // nodata 行无金额
 });
 
-test("合计行：无可计任务不追加「合计」段", () => {
+test("footer 注记恒在：无可计金额任务也含合计口径注记（不含金额求和）", () => {
   const task = makeTask({ taskId: "t1", status: "running", createdAt: 1 });
   const feed = buildFeed([task], [], [], new Map(), { now: NOW, pricing: TEST_PRICING });
-  assert.ok(!feed[2].includes("合计"), feed[2]);
+  assert.equal(feed[2], "活跃 1 · 排队 0 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
+});
+
+// ── 票 04：active-only 数据源（splitTasksForDisplay 接入，工具侧兜底） ─────────
+
+test("active-only：终态（done/aborted/cancelled/failed 用尽）不渲染，只有 3 种活跃态行", () => {
+  const tasks = [
+    makeTask({ taskId: "q1", status: "queued", createdAt: 100 }),
+    makeTask({ taskId: "r1", status: "running", createdAt: 200 }),
+    makeTask({ taskId: "t1", status: "timeout", createdAt: 300 }),
+    makeTask({ taskId: "d1", status: "done", createdAt: 400 }),
+    makeTask({ taskId: "a1", status: "aborted", createdAt: 500 }),
+    makeTask({ taskId: "c1", status: "cancelled", createdAt: 600 }),
+    makeTask({ taskId: "f1", status: "failed", attempts: 2, maxAttempts: 2, createdAt: 700 }), // 用尽=终态
+  ];
+  const feed = buildFeed(tasks, [], [], new Map(), { now: NOW });
+  assert.equal(feed.length, 5); // 表头 + 3 活跃行 + footer
+  const rows = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
+  assert.deepEqual(rows, ["q1", "r1", "t1"]);
+  for (const terminal of ["d1", "a1", "c1", "f1"]) {
+    assert.ok(!feed.join("\n").includes(terminal), `终态 ${terminal} 不应在面板`);
+  }
+});
+
+test("active 行序 createdAt ASC + taskId 破序（乱序输入 + 终态混入）", () => {
+  const tasks = [
+    makeTask({ taskId: "d2", status: "done", createdAt: 999 }),
+    makeTask({ taskId: "b1", status: "running", createdAt: 200 }),
+    makeTask({ taskId: "b2", status: "running", createdAt: 200 }), // 同 createdAt → taskId 破序
+    makeTask({ taskId: "a1", status: "queued", createdAt: 100 }),
+    makeTask({ taskId: "c1", status: "cancelled", createdAt: 300 }),
+  ];
+  const feed = buildFeed(tasks, [], [], new Map(), { now: NOW });
+  const rows = feed.slice(1, -1).map((line) => line.slice(0, 8).trim());
+  assert.deepEqual(rows, ["a1", "b1", "b2"]);
+});
+
+test("折叠行位置：>100 活跃时「另有 K 条排队」紧邻 footer 前一行", () => {
+  const tasks = Array.from({ length: 103 }, (_, i) =>
+    makeTask({ taskId: `t${String(i + 1).padStart(3, "0")}`, status: i < 100 ? "queued" : "running", createdAt: i + 1 }),
+  );
+  const feed = buildFeed(tasks, [], [], new Map(), { now: NOW });
+  assert.equal(feed.length, 103); // 表头 + 100 行 + 折叠行 + footer
+  assert.equal(feed[101], "另有 3 条排队");
+  assert.equal(feed[102], "活跃 103 · 排队 100 · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）");
 });

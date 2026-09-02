@@ -1,7 +1,8 @@
 // src/index.test.ts
 // 06 装配票单测：
 // 1) farm_status 侧纯渲染（fake tasks 数组：表头/行内容/排序/耗时 startedAt 口径/
-//    「会话保留 7 天」尾部提示/空列表）、<taskId> 详情渲染、--status 过滤枚举校验、
+//    尾部「活跃/排队 + 任务执行完即可清理」footer（active-only）/空列表）、<taskId> 详情渲染、
+//    --status 过滤枚举校验、
 //    nextAttemptAt/resumeCommandLine 边界（全部纯函数、零 I/O）。
 // 2) 修复轮「装配契约」测试：display 适配层契约（PaneInfo 对象数组 → pane_id
 //    字符串）→ farm 探测 seam——真 TaskStore/Queue/wireFarm + 真 adaptListPanes
@@ -32,6 +33,7 @@ import { wireFarm } from "./farm.ts";
 import type { FarmDoneMessage } from "./farm.ts";
 import type { PaneInfo } from "./display/protocol.ts";
 import { adaptListPanes } from "./display/adapt.ts";
+import { selectTasksForCleanup } from "./task-core/cleanup.ts";
 
 /** §13.3 全字段 fake task record（字段可覆盖）。 */
 function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -78,11 +80,11 @@ delete process.env.PI_AGENT_TEAMS_PANE;
 
 // ── renderFarmTable（5 列表格） ─────────────────────────────────────────────
 
-test("renderFarmTable: 表头 5 列（taskId 前 8 位/role/status/attempts/耗时）+ 尾部「会话保留 7 天」", () => {
+test("renderFarmTable: 表头 5 列（taskId 前 8 位/role/status/attempts/耗时）+ 尾部「任务执行完即可清理」", () => {
   const text = renderFarmTable([], NOW);
   const lines = text.split("\n");
   assert.equal(lines[0], "taskId   role         status   attempts 耗时");
-  assert.match(text, /共 0 个任务 · 会话保留 7 天/);
+  assert.match(text, /活跃 0 · 排队 0 · 任务执行完即可清理/);
 });
 
 test("renderFarmTable: 行内容——taskId 前 8 位截断、role/status 标签、attempts 分数、耗时", () => {
@@ -107,25 +109,22 @@ test("renderFarmTable: 行内容——taskId 前 8 位截断、role/status 标�
   assert.match(row, /1\.5s/);
 });
 
-test("renderFarmTable: 耗时 startedAt 口径——未 started → —；running → now-startedAt；done → updatedAt-startedAt", () => {
+test("renderFarmTable: 耗时 startedAt 口径——未 started → —；running → now-startedAt；timeout（活态非终态）→ now-startedAt", () => {
   const queued = makeTask({ taskId: "q1", status: "queued", startedAt: 0, createdAt: 100 });
   const running = makeTask({ taskId: "r1", status: "running", startedAt: 6_000, updatedAt: 6_000, createdAt: 200 });
-  const done = makeTask({
-    taskId: "d1",
-    status: "done",
-    startedAt: 1_000,
-    updatedAt: 4_000,
-    createdAt: 300,
-    result: { ...makeTask().result, exitCode: 0 },
-  });
-  const text = renderFarmTable([queued, running, done], NOW);
-  const qRow = text.split("\n")[1]!;
-  const rRow = text.split("\n")[2]!;
-  const dRow = text.split("\n")[3]!;
+  const timeout = makeTask({ taskId: "t1", status: "timeout", startedAt: 7_000, updatedAt: 7_000, createdAt: 300 });
+  // active-only（票 04）：done 终态不进面板；done 口径（updatedAt-startedAt）由下面
+  // 「durationText: 终态用 updatedAt 口径」用例（L246）直测覆盖。
+  const lines = renderFarmTable([queued, running, timeout], NOW).split("\n");
+  assert.equal(lines.length, 5); // 表头 + 3 活跃行 + footer
+  const qRow = lines[1]!;
+  const rRow = lines[2]!;
+  const tRow = lines[3]!;
   assert.match(qRow, /—/);
   assert.match(rRow, /4\.0s/);
-  assert.match(dRow, /3\.0s/);
-  assert.match(dRow, /完成/);
+  assert.match(tRow, /3\.0s/);
+  assert.match(tRow, /超时/);
+  assert.match(lines[4]!, /活跃 3 · 排队 1 · 任务执行完即可清理/);
 });
 
 test("renderFarmTable: 行按 createdAt 升序（taskId 破序），role 缺失显示 -", () => {
@@ -389,13 +388,17 @@ test("票 05 装配契约（源码序 pin）：executeSpawn 含 sync:true 分支
   assert.equal(waitCount, 2, "两处 schema 都含 wait_timeout_secs");
 });
 
-test("FR8 恒定：registerTool 工具名去重 = 5（sync 为参数非新工具名，票 05）", async () => {
+test("FR8 恒定：registerTool 工具名去重 = 6（farm_cleanup 第 6 工具，票 05）", async () => {
   const src = await readFile(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
   const names = new Set<string>();
   const re = /registerTool\(\{[^}]*?name: "([a-z_]+)"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) names.add(m[1]!);
-  assert.deepEqual([...names].sort(), ["farm_resume", "farm_status", "msg", "spawn_visible_agent", "steer"].sort(), "5 工具恒定（FR8）");
+  assert.deepEqual(
+    [...names].sort(),
+    ["farm_cleanup", "farm_resume", "farm_status", "msg", "spawn_visible_agent", "steer"].sort(),
+    "6 工具恒定（FR8）",
+  );
 });
 
 test("M8 修复：心跳 onUpdate 契约 = 对象 {content:[{type:'text'}]}（非字符串，防 TUI result.content undefined 崩溃）", async () => {
@@ -466,4 +469,185 @@ test("装配契约：pane 真消失 → 适配层保留差集探测 → aborted 
   const text = seam.messages[0]?.text ?? "";
   assert.match(text, /seam-gon/); // buildDoneText taskId 前 8 位口径
   assert.match(text, /中止/);
+});
+
+// ── 票 05 farm_cleanup 工具 + 教学 description + 双截断统一 ─────────────────────
+
+/** index.ts 源码读取（源码序 pin 惯例，index.test.ts 严禁 import index.ts）。 */
+async function readIndexSrc(): Promise<string> {
+  return readFile(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+}
+
+/** farm_cleanup 源码区（代码段 + 注册段）切片：票 05 源码序 pin 用。 */
+async function cleanupSrcRegion(tail = 3500): Promise<string> {
+  const src = await readIndexSrc();
+  const codeStart = src.indexOf("// ── farm_cleanup 工具");
+  const regIdx = src.indexOf('name: "farm_cleanup"');
+  assert.ok(codeStart > 0 && regIdx > codeStart, "farm_cleanup 代码段与注册段都存在");
+  return src.slice(codeStart, regIdx + tail);
+}
+
+test("票 05 注册序：farm_cleanup 紧接 farm_status 后、mini-farm 分支前（main+depth-1 共享路径）", async () => {
+  const src = await readIndexSrc();
+  const statusIdx = src.indexOf('name: "farm_status"');
+  const cleanupIdx = src.indexOf('name: "farm_cleanup"');
+  const miniIdx = src.indexOf("assembleMiniFarm(pi, { display, store, agentRoles, inbox });");
+  assert.ok(statusIdx > 0 && cleanupIdx > statusIdx, "farm_cleanup 注册在 farm_status 之后");
+  assert.ok(
+    cleanupIdx < miniIdx,
+    "farm_cleanup 在 depth-1 mini-farm 分支之前（共享路径，main + depth-1 都注册）",
+  );
+});
+
+test("票 05 schema：confirm（Boolean，缺省 false=dry-run）+ status（String 逗号分隔真终态子集）", async () => {
+  const src = await readIndexSrc();
+  const regIdx = src.indexOf('name: "farm_cleanup"');
+  const region = src.slice(regIdx, regIdx + 1800);
+  assert.match(region, /confirm: Type\.Optional\(Type\.Boolean/);
+  assert.match(region, /status: Type\.Optional\(\s*Type\.String/);
+  assert.match(region, /逗号分隔的真终态子集/);
+  assert.match(region, /缺省 = done,cancelled,failed/);
+  assert.match(region, /aborted 默认排除、显式点名才清/);
+});
+
+test("票 05 description 教学 2 必含 + promptGuidelines（任务一次性即清 / 先报告再 confirm；aborted 唯一例外）", async () => {
+  const src = await readIndexSrc();
+  const regIdx = src.indexOf('name: "farm_cleanup"');
+  const region = src.slice(regIdx, regIdx + 2600);
+  // 教学 ①：任务一次性——执行完毕（结果通知已收到）即可随时清理，不必等用户要求；aborted 唯一例外
+  assert.match(region, /任务一次性——执行完毕（结果通知已收到）即可随时清理，不必等用户要求/);
+  assert.match(region, /aborted 是唯一例外（可 farm_resume 恢复），默认不碰、显式 --status aborted 点名才清/);
+  // 教学 ②：永远先跑报告（默认 dry-run），读 skipped 分组（未通知是正常非 bug）再 --confirm
+  assert.match(region, /永远先跑报告（默认 dry-run，不删除），读 skipped 分组（未通知是正常非 bug）再 --confirm 执行/);
+  // promptGuidelines 草案要点
+  assert.match(region, /批量 spawn 完成后顺手清理/);
+  assert.match(region, /费用减少透明汇报：--confirm 前后对照合计/);
+  assert.match(region, /清理后可用 farm_status 闭环验证/);
+  assert.match(region, /per-workspace 边界：depth-1 角色 agent 可清理 main 层任务/);
+  assert.match(region, /与自动 GC 双轨：主动清理更快，GC 24h 兜底/);
+  assert.match(region, /清理≠取消任务：queued\/running\/timeout 非终态一律拒绝/);
+});
+
+test("票 05 farm_status 教学链第一环：sessions 3 days + 终态可随时 farm_cleanup 清理", async () => {
+  const src = await readIndexSrc();
+  const statusIdx = src.indexOf('name: "farm_status"');
+  const cleanupIdx = src.indexOf('name: "farm_cleanup"');
+  const region = src.slice(statusIdx, cleanupIdx);
+  assert.match(region, /sessions are kept 3 days/);
+  assert.match(region, /终态任务可随时用 farm_cleanup 清理/);
+  assert.match(region, /Finished tasks can be cleaned up anytime with farm_cleanup/);
+});
+
+test("票 05 拒绝路径：非终态（queued/running/timeout）与未知 status → ❌ 拒绝（白名单仅真终态四态）", async () => {
+  const region = await cleanupSrcRegion();
+  assert.match(region, /只接受真终态 \$\{CLEANUP_STATUSES\.join\("\/"\)\}（逗号分隔）/);
+  assert.match(region, /queued\/running\/timeout 非终态不可清理（timeout 可能自动复活重试）/);
+  // 白名单常量 pin：真终态四态；缺省集不含 aborted（默认排除）
+  assert.match(region, /CLEANUP_STATUSES = \["done", "cancelled", "failed", "aborted"\]/);
+  assert.match(region, /DEFAULT_CLEANUP_STATUSES: ReadonlySet<TaskStatus> = new Set\(\["done", "cancelled", "failed"\]\)/);
+});
+
+test("票 05 aborted 缺省排除 + 显式点名才清（selectTasksForCleanup 白名单行为级）", () => {
+  const now = NOW;
+  const abortedNotified = makeTask({
+    taskId: "ab1",
+    status: "aborted",
+    notifiedAt: now,
+    updatedAt: now - 1000,
+    attempts: 1,
+    maxAttempts: 2,
+  });
+  const abortedUnnotified = makeTask({
+    taskId: "ab2",
+    status: "aborted",
+    notifiedAt: 0,
+    updatedAt: now - 1000,
+    attempts: 1,
+    maxAttempts: 2,
+  });
+  const done = makeTask({ taskId: "do1", status: "done", notifiedAt: now, updatedAt: now - 1000 });
+  // 缺省集 {done, cancelled, failed}（index.ts 显式传 DEFAULT_CLEANUP_STATUSES）：aborted 不入 deletable
+  const sel = selectTasksForCleanup([abortedNotified, abortedUnnotified, done], now, {
+    replayWindowMs: 24 * 3600 * 1000,
+    statuses: new Set(["done", "cancelled", "failed"]),
+  });
+  assert.equal(sel.deletable.length, 1);
+  assert.equal(sel.deletable[0]!.taskId, "do1");
+  // 显式点名 aborted：已通知可清；未通知仍被通知守卫挡住（skipped.unnotified）
+  const named = selectTasksForCleanup([abortedNotified, abortedUnnotified], now, {
+    replayWindowMs: 24 * 3600 * 1000,
+    statuses: new Set(["done", "cancelled", "failed", "aborted"]),
+  });
+  assert.equal(named.deletable.length, 1);
+  assert.equal(named.deletable[0]!.taskId, "ab1");
+  assert.equal(named.skipped.unnotified.length, 1);
+  assert.equal(named.skipped.unnotified[0]!.taskId, "ab2");
+});
+
+test("票 05 复查式删除（真 TaskStore 行为级）：已通知 done 可删；未通知 skipped；已复活（failed 可重试）not-terminal；已删再删 missing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-teams-cleanup-"));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const store = new TaskStore(root);
+  const now = Date.now();
+  const doneNotified = makeTask({ taskId: "del-ok", status: "done", notifiedAt: now, updatedAt: now - 1000 });
+  const doneUnnotified = makeTask({ taskId: "del-un", status: "done", notifiedAt: 0, updatedAt: now - 1000 });
+  const live = makeTask({ taskId: "del-live", status: "running" });
+  const revived = makeTask({ taskId: "del-rev", status: "failed", notifiedAt: now, attempts: 1, maxAttempts: 2 });
+  for (const task of [doneNotified, doneUnnotified, live, revived]) await store.writeTask(task);
+
+  assert.deepEqual(await store.deleteTask("del-ok"), { deleted: true });
+  assert.deepEqual(await store.deleteTask("del-un"), { deleted: false, reason: "unnotified" });
+  assert.deepEqual(await store.deleteTask("del-live"), { deleted: false, reason: "not-terminal" });
+  assert.deepEqual(await store.deleteTask("del-rev"), { deleted: false, reason: "not-terminal" });
+  assert.deepEqual(await store.deleteTask("del-ok"), { deleted: false, reason: "missing" });
+});
+
+test("票 05 费用影响与四类文案（✅❌⏳⚠️）+ aborted 侧成本注记 + 空态", async () => {
+  const region = await cleanupSrcRegion();
+  // 费用口径：仅计 result.cost，aborted 侧成本不计入；占位价注记
+  assert.match(region, /仅计 result\.cost，aborted 侧成本不计入/);
+  assert.match(region, /⚠️ 成本为占位价：请编辑 ~\/\.pi-agent-teams\/pricing\.json 校准/);
+  // 四类文案锚点
+  assert.match(region, /✅ 已清理 \$\{deleted\} 个任务/);
+  assert.match(region, /⏳ farm_cleanup 报告（dry-run，未删除任何任务）/);
+  assert.match(region, /❌ 非法 status/);
+  assert.match(region, /⚠️ \$\{failed\} 个删除失败（已跳过）/);
+  // 空态：无可清理（真终态且已通知才可清；aborted 默认保留）
+  assert.match(region, /无可清理（真终态且已通知才可清；aborted 默认保留）/);
+});
+
+test("票 05 双截断统一：613 executeFarmStatus 与 1076 refreshPanel 均走 splitTasksForDisplay（读盘上界 ≤150）", async () => {
+  const src = await readIndexSrc();
+  // 613：executeFarmStatus 本地 renderFarmToolTable（弃用 probe.renderFarmTable 调用）
+  assert.ok(!src.includes("renderFarmTable("), "index.ts 不再调用 renderFarmTable（probe 保留不动）");
+  assert.match(src, /renderFarmToolTable\(filtered, now\)/);
+  assert.match(src, /splitTasksForDisplay\(filtered, PANEL_RECENT_N\)/);
+  // 活跃硬顶 PANEL_MAX_ROWS 折叠
+  assert.match(src, /activeSorted\.slice\(0, PANEL_MAX_ROWS\)/);
+  // 1076：refreshPanel shown 集 = 活跃硬顶 + 最近终态（读盘上界 ≤ 100 + 50 = 150，BE#5 保持）
+  assert.match(src, /splitTasksForDisplay\(tasks, PANEL_RECENT_N\)/);
+  assert.match(src, /const shown = \[\.\.\.active\.slice\(0, PANEL_MAX_ROWS\), \.\.\.recent\];/);
+  // PANEL_RECENT_N 保留 = recent 上界
+  assert.match(src, /const PANEL_RECENT_N = 50/);
+});
+
+test("票 05 grep 白名单负向：index.ts 零匹配 7 天/7d/7 days（会话保留口径 7→3 天）", async () => {
+  const src = await readIndexSrc();
+  assert.doesNotMatch(src, /7\s?天|7\s?d|7 days/i, "index.ts 无 7 天/7d/7 days 残留");
+  // 正向锚点：3 天口径就位（farm_status description / farm_resume description / L19 注释）
+  assert.match(src, /sessions are kept 3 days/);
+  assert.match(src, /≤3d session GC window/);
+  assert.match(src, />3d\), resume reports/);
+  assert.match(src, /GC 3d 口径/);
+});
+
+test("票 05 farm_resume 已删任务友好文案（🟡48 R6）：readTask→null 预检返回「可能已被 farm_cleanup 清理」", async () => {
+  const src = await readIndexSrc();
+  const resumeIdx = src.indexOf("function registerResumeTool");
+  const region = src.slice(resumeIdx, resumeIdx + 2200);
+  assert.match(region, /const record = await store\.readTask\(resumeParams\.taskId\);/);
+  assert.match(region, /可能已被 farm_cleanup 清理（终态任务清理后不可恢复；aborted 默认保留，可 resume）/);
+  assert.ok(region.indexOf("executeResume(resumeParams") > region.indexOf("record === null"), "预检在 executeResume 之前");
 });

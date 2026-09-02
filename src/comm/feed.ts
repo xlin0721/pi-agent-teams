@@ -1,24 +1,37 @@
 // src/comm/feed.ts
 // comm 面板聚合视图（票 01）：5 列台账 + usage + 投递态 + 计数行，纯渲染零副作用。
-// 票 07 面板（setWidget）消费；本模块只 import node 内置之外的零依赖相对 .ts：
-//   - probe.ts 三个导出（FARM_STATUS_LABELS / durationText / sortTasksForDisplay）
-//     ——probe.ts 的 padCell/spawnRole 是私有不可 import，feed 内本地 padCell（列宽
-//     与 renderFarmTable 逐字对齐：8/12/8/8）。
-//   - presence.ts 的 isAlive（存活计数）。
+// 票 07 面板（setWidget）消费；票 04：active-only shown 源 + 行硬顶 100 + 折叠 +
+// footer 简化（即清 + 合计口径注记），recentN 废弃。本模块只 import node 内置之外的
+// 零依赖相对 .ts：
+//   - probe.ts 四个导出（FARM_STATUS_LABELS / durationText / sortTasksForDisplay /
+//     PANEL_MAX_ROWS）——probe.ts 的 padCell/spawnRole 是私有不可 import，feed 内本地
+//     padCell（列宽与 renderFarmTable 逐字对齐：8/12/8/8）。
+//   - task-core/cleanup.ts 的 splitTasksForDisplay（面板 active-only 谓词唯一源，与
+//     farm_status 工具侧零漂移，3a 白名单合法）。
 //   - steer.ts 的 pickLatest（投递态列取该 pane 最新消息）。
 
 import type { TaskRecord } from "../task-core/store.ts";
 import type { UsageSidecar } from "../task-core/queue.ts";
 import { pickLatest, type InboxMessage } from "../task-core/steer.ts";
-import { FARM_STATUS_LABELS, durationText, sortTasksForDisplay } from "../probe.ts";
-import { isAlive, type Presence } from "./presence.ts";
+import { splitTasksForDisplay } from "../task-core/cleanup.ts";
+import {
+  FARM_STATUS_LABELS,
+  durationText,
+  sortTasksForDisplay,
+  PANEL_MAX_ROWS,
+} from "../probe.ts";
+import type { Presence } from "./presence.ts";
 import { costAmount, DEFAULT_PRICING_TABLE, formatCost } from "../pricing.ts";
 import type { PricingTable } from "../pricing.ts";
 
 export interface FeedOptions {
-  /** 时间锚（耗时/存活/投递态）；缺省 Date.now() */
+  /** 时间锚（耗时/投递态）；缺省 Date.now() */
   now?: number;
-  /** BE#5：面板最多显示的任务行数（recent N）；缺省 50；<=0 = 不限制 */
+  /**
+   * 已废弃（no-op，票 04）：面板 active-only 后不再按 recentN 截断——行硬顶/截断
+   * 统一归 05 的 splitTasksForDisplay 双截断。字段保留仅为 index.ts:1079 字面量
+   * 多余属性校验不报错（签名零变更，R1），05 接线后删除。
+   */
   recentN?: number;
   /** FE#4：行宽上限——usage/投递态列右向截断（省略号）；缺省 = 不截断 */
   maxWidth?: number;
@@ -94,8 +107,12 @@ function truncateRight(text: string, maxWidth: number): string {
 }
 
 /**
- * 面板聚合视图：表头 + 任务行（createdAt 升序，recent N 取尾部最新）+ 计数行。
- * 返回 string[]（setWidget 行数组）。纯函数：不改任何输入。
+ * 面板聚合视图（票 04）：表头 + 活跃任务行（shown 源 =
+ * splitTasksForDisplay(tasks, 0).active + sortTasksForDisplay 定序；终态完成即不在
+ * 面板）+ 行硬顶 PANEL_MAX_ROWS（超出折叠「另有 K 条排队」行，footer 前）+ footer
+ * （活跃/排队计数 + 即清 + 合计口径静态注记；金额求和已移除，D3-A）。
+ * presence 参数保留（签名兼容，不再消费存活计数）。返回 string[]（setWidget 行数组）。
+ * 纯函数：不改任何输入。
  */
 export function buildFeed(
   tasks: readonly TaskRecord[],
@@ -106,10 +123,9 @@ export function buildFeed(
 ): string[] {
   const now = opts.now ?? Date.now();
   const pricing = opts.pricing ?? DEFAULT_PRICING_TABLE;
-  const sorted = sortTasksForDisplay(tasks);
-  const recentN = opts.recentN ?? 50;
-  const shown = recentN > 0 && sorted.length > recentN ? sorted.slice(-recentN) : sorted;
-  const aliveCount = presence.filter((p) => isAlive(p, now)).length;
+  const { active } = splitTasksForDisplay(tasks, 0);
+  const sorted = sortTasksForDisplay(active);
+  const shown = sorted.slice(0, PANEL_MAX_ROWS);
   const maxWidth =
     typeof opts.maxWidth === "number" && Number.isFinite(opts.maxWidth) && opts.maxWidth > 0
       ? Math.floor(opts.maxWidth)
@@ -126,25 +142,9 @@ export function buildFeed(
     lines.push(maxWidth > 0 ? truncateRight(row, maxWidth) : row);
   }
 
-  let countLine = `共 ${tasks.length} 个任务 · 存活 ${aliveCount} · 会话保留 7 天`;
-  if (recentN > 0 && sorted.length > recentN) {
-    countLine += `（显示最近 ${shown.length}/${tasks.length}）`;
-  }
-  // 合计（票 05）：遍历全部 tasks，costSourceFor + costAmount 求和（unknown/null 排除）；
-  // 无可计任务不追加「合计」段。
-  let total = 0;
-  let hasTotal = false;
-  for (const task of tasks) {
-    const source = costSourceFor(task, usageMap.get(task.taskId));
-    if (source === null) continue;
-    const amount = costAmount(pricing, source.model, source.inputTokens, source.outputTokens);
-    if (amount === null) continue;
-    total += amount;
-    hasTotal = true;
-  }
-  if (hasTotal) {
-    countLine += ` · 合计 ${formatCost(total, pricing.currency)}`;
-  }
-  lines.push(countLine);
+  const folded = sorted.length - PANEL_MAX_ROWS;
+  if (folded > 0) lines.push(`另有 ${folded} 条排队`);
+  const queued = sorted.filter((task) => task.status === "queued").length;
+  lines.push(`活跃 ${sorted.length} · 排队 ${queued} · 任务执行完即可清理 · 合计=保留期内列表费用（历史不累计）`);
   return lines;
 }
